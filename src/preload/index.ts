@@ -1,4 +1,7 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import {
+  contextBridge,
+  ipcRenderer
+} from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
 interface JavaInfo {
@@ -11,9 +14,26 @@ interface JavaInfo {
   error: string | null
 }
 
+interface MinecraftVersionInfo {
+  available: boolean
+  id: string
+  type: string | null
+  releaseTime: string | null
+  metadataUrl: string | null
+  latestRelease: string | null
+  error: string | null
+}
+
 interface AuroraAPI {
   getJavaInfo: () => Promise<JavaInfo>
+
+  checkMinecraftVersion: (
+    versionId: string,
+    forceRefresh?: boolean
+  ) => Promise<MinecraftVersionInfo>
+
   getDefaultGameDirectory: () => Promise<string>
+
   chooseGameDirectory: (
     currentPath: string | null
   ) => Promise<string | null>
@@ -26,11 +46,23 @@ const api: AuroraAPI = {
     ) as Promise<JavaInfo>
   },
 
-  getDefaultGameDirectory: async (): Promise<string> => {
+  checkMinecraftVersion: async (
+    versionId: string,
+    forceRefresh = false
+  ): Promise<MinecraftVersionInfo> => {
     return ipcRenderer.invoke(
-      'folder:get-default-game-directory'
-    ) as Promise<string>
+      'minecraft:check-version',
+      versionId,
+      forceRefresh
+    ) as Promise<MinecraftVersionInfo>
   },
+
+  getDefaultGameDirectory:
+    async (): Promise<string> => {
+      return ipcRenderer.invoke(
+        'folder:get-default-game-directory'
+      ) as Promise<string>
+    },
 
   chooseGameDirectory: async (
     currentPath: string | null
@@ -42,5 +74,12 @@ const api: AuroraAPI = {
   }
 }
 
-contextBridge.exposeInMainWorld('electron', electronAPI)
-contextBridge.exposeInMainWorld('api', api)
+contextBridge.exposeInMainWorld(
+  'electron',
+  electronAPI
+)
+
+contextBridge.exposeInMainWorld(
+  'api',
+  api
+)

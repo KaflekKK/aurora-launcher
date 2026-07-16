@@ -10,8 +10,23 @@ interface JavaInfo {
   error: string | null
 }
 
+interface MinecraftVersionInfo {
+  available: boolean
+  id: string
+  type: string | null
+  releaseTime: string | null
+  metadataUrl: string | null
+  latestRelease: string | null
+  error: string | null
+}
+
 interface AuroraAPI {
   getJavaInfo: () => Promise<JavaInfo>
+
+  checkMinecraftVersion: (
+    versionId: string,
+    forceRefresh?: boolean
+  ) => Promise<MinecraftVersionInfo>
 
   getDefaultGameDirectory: () => Promise<string>
 
