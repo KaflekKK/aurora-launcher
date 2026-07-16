@@ -1,7 +1,19 @@
-import { useCallback, useEffect, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState
+} from 'react'
 
 type Page = 'home' | 'profiles' | 'settings'
 type MinecraftVersion = '1.21.11' | '1.21.4' | '1.20.1'
+
+type InstallPhase =
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
+  | 'complete'
+  | 'error'
 
 interface LauncherSettings {
   minecraftVersion: MinecraftVersion
@@ -54,6 +66,27 @@ interface MinecraftVersionDetails {
   error: string | null
 }
 
+interface MinecraftInstallProgress {
+  versionId: string
+  phase: InstallPhase
+  downloadedBytes: number
+  totalBytes: number
+  percent: number
+  message: string
+}
+
+interface MinecraftInstallStatus {
+  versionId: string
+  installed: boolean
+  valid: boolean
+  jarPath: string | null
+  currentSize: number | null
+  expectedSize: number | null
+  currentSha1: string | null
+  expectedSha1: string | null
+  error: string | null
+}
+
 interface DetailItemProps {
   label: string
   value: string
@@ -70,7 +103,11 @@ const DEFAULT_SETTINGS: LauncherSettings = {
 }
 
 function isMinecraftVersion(value: unknown): value is MinecraftVersion {
-  return value === '1.21.11' || value === '1.21.4' || value === '1.20.1'
+  return (
+    value === '1.21.11' ||
+    value === '1.21.4' ||
+    value === '1.20.1'
+  )
 }
 
 function loadSettings(): LauncherSettings {
@@ -81,7 +118,9 @@ function loadSettings(): LauncherSettings {
       return DEFAULT_SETTINGS
     }
 
-    const parsed = JSON.parse(savedSettings) as Partial<LauncherSettings>
+    const parsed = JSON.parse(
+      savedSettings
+    ) as Partial<LauncherSettings>
 
     return {
       minecraftVersion: isMinecraftVersion(parsed.minecraftVersion)
@@ -223,7 +262,17 @@ function App(): React.JSX.Element {
     useState<MinecraftVersionDetails | null>(null)
   const [minecraftLoading, setMinecraftLoading] = useState(true)
 
+  const [installStatus, setInstallStatus] =
+    useState<MinecraftInstallStatus | null>(null)
+  const [installStatusLoading, setInstallStatusLoading] = useState(true)
+  const [installProgress, setInstallProgress] =
+    useState<MinecraftInstallProgress | null>(null)
+  const [installing, setInstalling] = useState(false)
+
   const [folderChoosing, setFolderChoosing] = useState(false)
+
+  const minecraftRequestId = useRef(0)
+  const installStatusRequestId = useRef(0)
 
   const refreshJavaInfo = useCallback(async (): Promise<void> => {
     setJavaLoading(true)
@@ -253,6 +302,7 @@ function App(): React.JSX.Element {
       version: MinecraftVersion,
       forceRefresh = false
     ): Promise<void> => {
+      const requestId = ++minecraftRequestId.current
       setMinecraftLoading(true)
 
       try {
@@ -261,9 +311,17 @@ function App(): React.JSX.Element {
           window.api.getMinecraftVersionDetails(version, forceRefresh)
         ])
 
+        if (requestId !== minecraftRequestId.current) {
+          return
+        }
+
         setVersionInfo(info)
         setVersionDetails(details)
       } catch (error) {
+        if (requestId !== minecraftRequestId.current) {
+          return
+        }
+
         console.error('Nie udało się sprawdzić wersji Minecraft:', error)
 
         setVersionInfo({
@@ -278,7 +336,62 @@ function App(): React.JSX.Element {
 
         setVersionDetails(null)
       } finally {
-        setMinecraftLoading(false)
+        if (requestId === minecraftRequestId.current) {
+          setMinecraftLoading(false)
+        }
+      }
+    },
+    []
+  )
+
+  const refreshInstallStatus = useCallback(
+    async (
+      version: MinecraftVersion,
+      directory: string
+    ): Promise<void> => {
+      const requestId = ++installStatusRequestId.current
+
+      if (!directory) {
+        setInstallStatus(null)
+        setInstallStatusLoading(false)
+        return
+      }
+
+      setInstallStatusLoading(true)
+
+      try {
+        const result = await window.api.getMinecraftInstallStatus(
+          version,
+          directory
+        )
+
+        if (requestId !== installStatusRequestId.current) {
+          return
+        }
+
+        setInstallStatus(result)
+      } catch (error) {
+        if (requestId !== installStatusRequestId.current) {
+          return
+        }
+
+        console.error('Nie udało się sprawdzić instalacji:', error)
+
+        setInstallStatus({
+          versionId: version,
+          installed: false,
+          valid: false,
+          jarPath: null,
+          currentSize: null,
+          expectedSize: null,
+          currentSha1: null,
+          expectedSha1: null,
+          error: 'Nie udało się sprawdzić pliku klienta.'
+        })
+      } finally {
+        if (requestId === installStatusRequestId.current) {
+          setInstallStatusLoading(false)
+        }
       }
     },
     []
@@ -300,8 +413,25 @@ function App(): React.JSX.Element {
   }, [initialSettings.gameDirectory, refreshJavaInfo])
 
   useEffect(() => {
+    setInstallProgress(null)
     void refreshMinecraftData(minecraftVersion)
   }, [minecraftVersion, refreshMinecraftData])
+
+  useEffect(() => {
+    void refreshInstallStatus(minecraftVersion, gameDirectory)
+  }, [minecraftVersion, gameDirectory, refreshInstallStatus])
+
+  useEffect(() => {
+    window.api.onInstallProgress((progress) => {
+      if (progress.versionId === minecraftVersion) {
+        setInstallProgress(progress)
+      }
+    })
+
+    return () => {
+      window.api.removeInstallProgressListener()
+    }
+  }, [minecraftVersion])
 
   async function chooseGameDirectory(): Promise<void> {
     setFolderChoosing(true)
@@ -319,6 +449,58 @@ function App(): React.JSX.Element {
       alert('Nie udało się otworzyć okna wyboru folderu.')
     } finally {
       setFolderChoosing(false)
+    }
+  }
+
+  async function installMinecraftClient(): Promise<void> {
+    if (!gameDirectory) {
+      alert('Najpierw wybierz folder gry w ustawieniach.')
+      setPage('settings')
+      return
+    }
+
+    if (!versionDetails?.available) {
+      alert('Dane wybranej wersji Minecrafta nie są gotowe.')
+      return
+    }
+
+    setInstalling(true)
+    setInstallProgress({
+      versionId: minecraftVersion,
+      phase: 'checking',
+      downloadedBytes: 0,
+      totalBytes: versionDetails.clientSize ?? 0,
+      percent: 0,
+      message: 'Przygotowywanie instalacji...'
+    })
+
+    try {
+      const result = await window.api.installMinecraftClient(
+        minecraftVersion,
+        gameDirectory
+      )
+
+      await refreshInstallStatus(minecraftVersion, gameDirectory)
+
+      if (!result.success) {
+        alert(
+          `Nie udało się zainstalować Minecraft ${minecraftVersion}.\n\n` +
+            `${result.error ?? 'Nieznany błąd.'}`
+        )
+        return
+      }
+
+      alert(
+        result.alreadyInstalled
+          ? `Minecraft ${minecraftVersion} jest już poprawnie zainstalowany.`
+          : `Pobrano i sprawdzono plik klienta Minecraft ${minecraftVersion}.\n\n` +
+              `Plik: ${result.jarPath ?? 'brak ścieżki'}`
+      )
+    } catch (error) {
+      console.error('Nie udało się zainstalować klienta:', error)
+      alert('Nie udało się rozpocząć instalacji klienta.')
+    } finally {
+      setInstalling(false)
     }
   }
 
@@ -347,20 +529,8 @@ function App(): React.JSX.Element {
   }
 
   function playMinecraft(): void {
-    if (minecraftLoading) {
-      alert('Trwa pobieranie danych wersji Minecrafta.')
-      return
-    }
-
-    if (!versionInfo?.available || !versionDetails?.available) {
-      alert(
-        `Nie można przygotować Minecraft ${minecraftVersion}.\n\n` +
-          `${
-            versionDetails?.error ??
-            versionInfo?.error ??
-            'Wersja jest niedostępna.'
-          }`
-      )
+    if (!installStatus?.valid) {
+      void installMinecraftClient()
       return
     }
 
@@ -370,22 +540,13 @@ function App(): React.JSX.Element {
       return
     }
 
-    if (!gameDirectory) {
-      alert('Nie ustawiono folderu gry.')
-      setPage('settings')
-      return
-    }
-
     alert(
       `Aurora Client\n` +
         `Minecraft ${minecraftVersion}\n` +
         `RAM: ${ram} GB\n` +
         `Java: ${javaInfo.version ?? 'nieznana'}\n` +
-        `Wymagana Java: ${
-          versionDetails.javaMajorVersion ?? 'brak danych'
-        }\n` +
-        `Biblioteki: ${versionDetails.libraryCount}\n\n` +
-        `Dane wersji są gotowe.`
+        `Plik klienta: poprawny\n\n` +
+        `Biblioteki, assety, logowanie i prawdziwe uruchamianie dodamy w kolejnych etapach.`
     )
   }
 
@@ -424,10 +585,59 @@ function App(): React.JSX.Element {
       : `Dostępna · ${versionType}`
   }
 
-  const canPlay =
+  function getInstallStatusText(): string {
+    if (installing && installProgress) {
+      return installProgress.message
+    }
+
+    if (installStatusLoading) {
+      return 'Sprawdzanie pliku klienta...'
+    }
+
+    if (installStatus?.valid) {
+      return `Zainstalowana · ${formatBytes(installStatus.currentSize)}`
+    }
+
+    if (installStatus?.installed) {
+      return installStatus.error ?? 'Plik klienta wymaga naprawy.'
+    }
+
+    if (installStatus?.error) {
+      return installStatus.error
+    }
+
+    return 'Wymaga instalacji'
+  }
+
+  const versionReady =
     !minecraftLoading &&
     versionInfo?.available === true &&
     versionDetails?.available === true
+
+  const clientInstalled = installStatus?.valid === true
+
+  const mainActionDisabled =
+    installing ||
+    minecraftLoading ||
+    installStatusLoading ||
+    !versionReady ||
+    !gameDirectory
+
+  const mainActionText = installing
+    ? `${installProgress?.percent ?? 0}%`
+    : clientInstalled
+      ? 'GRAJ'
+      : 'ZAINSTALUJ'
+
+  const topStatusText = installing
+    ? 'Instalowanie klienta'
+    : minecraftLoading
+      ? 'Pobieranie danych wersji'
+      : installStatusLoading
+        ? 'Sprawdzanie instalacji'
+        : clientInstalled
+          ? 'Launcher gotowy'
+          : 'Wymaga instalacji'
 
   return (
     <div className="launcher">
@@ -486,7 +696,7 @@ function App(): React.JSX.Element {
             </div>
           </div>
 
-          <span className="app-version">Aurora Launcher v0.6.0</span>
+          <span className="app-version">Aurora Launcher v0.7.0</span>
         </div>
       </aside>
 
@@ -494,12 +704,7 @@ function App(): React.JSX.Element {
         <header className="topbar">
           <div className="status">
             <span className="status-dot" />
-
-            {minecraftLoading
-              ? 'Pobieranie danych wersji'
-              : canPlay
-                ? 'Launcher gotowy'
-                : 'Problem z wersją'}
+            {topStatusText}
           </div>
 
           <button
@@ -565,6 +770,7 @@ function App(): React.JSX.Element {
                 <select
                   id="minecraft-version"
                   value={minecraftVersion}
+                  disabled={installing}
                   onChange={(event) =>
                     setMinecraftVersion(
                       event.target.value as MinecraftVersion
@@ -578,32 +784,85 @@ function App(): React.JSX.Element {
 
                 <span
                   style={{
-                    color: minecraftLoading
-                      ? '#8d8195'
-                      : canPlay
-                        ? '#c084fc'
-                        : '#ff8faf',
+                    color: clientInstalled ? '#c084fc' : '#a89bad',
                     fontSize: '9px',
                     lineHeight: 1.35
                   }}
                 >
-                  {getVersionStatusText()}
+                  {getInstallStatusText()}
                 </span>
               </div>
 
               <button
                 type="button"
                 className="play-button"
-                disabled={!canPlay}
-                onClick={playMinecraft}
+                disabled={mainActionDisabled}
+                onClick={clientInstalled ? playMinecraft : () => void installMinecraftClient()}
                 style={{
-                  opacity: canPlay ? 1 : 0.5,
-                  cursor: canPlay ? 'pointer' : 'not-allowed'
+                  opacity: mainActionDisabled ? 0.5 : 1,
+                  cursor: mainActionDisabled ? 'not-allowed' : 'pointer'
                 }}
               >
-                <span>▶</span>
-                GRAJ
+                <span>{clientInstalled ? '▶' : '↓'}</span>
+                {mainActionText}
               </button>
+
+              {(installing || installProgress) && (
+                <div
+                  style={{
+                    gridColumn: '1 / -1',
+                    display: 'grid',
+                    gap: '8px'
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      gap: '12px',
+                      color:
+                        installProgress?.phase === 'error'
+                          ? '#ff8faf'
+                          : '#a99db0',
+                      fontSize: '9px'
+                    }}
+                  >
+                    <span>
+                      {installProgress?.message ?? 'Przygotowywanie...'}
+                    </span>
+
+                    <span>
+                      {formatBytes(installProgress?.downloadedBytes ?? 0)} /{' '}
+                      {formatBytes(
+                        installProgress?.totalBytes ??
+                          versionDetails?.clientSize ??
+                          null
+                      )}
+                    </span>
+                  </div>
+
+                  <div
+                    style={{
+                      height: '6px',
+                      overflow: 'hidden',
+                      background: 'rgba(255, 255, 255, 0.055)',
+                      border: '1px solid rgba(192, 132, 252, 0.12)',
+                      borderRadius: '20px'
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${installProgress?.percent ?? 0}%`,
+                        height: '100%',
+                        background:
+                          'linear-gradient(90deg, #7c3aed, #a855f7)',
+                        boxShadow: '0 0 14px rgba(168, 85, 247, 0.55)',
+                        transition: 'width 120ms ease'
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           </section>
         )}
@@ -636,11 +895,11 @@ function App(): React.JSX.Element {
                 </div>
 
                 <span className="active-badge">
-                  {minecraftLoading
-                    ? 'SPRAWDZANIE'
-                    : canPlay
-                      ? 'DOSTĘPNY'
-                      : 'BŁĄD'}
+                  {installing
+                    ? `${installProgress?.percent ?? 0}%`
+                    : clientInstalled
+                      ? 'ZAINSTALOWANY'
+                      : 'DO INSTALACJI'}
                 </span>
               </article>
 
@@ -689,12 +948,105 @@ function App(): React.JSX.Element {
               <article className="settings-card">
                 <div className="setting-top">
                   <div>
+                    <h2>Instalacja klienta</h2>
+                    <p>
+                      Oficjalny plik klienta wybranej wersji Minecrafta.
+                    </p>
+                  </div>
+
+                  <strong>
+                    {installing
+                      ? `${installProgress?.percent ?? 0}%`
+                      : installStatusLoading
+                        ? '...'
+                        : clientInstalled
+                          ? 'Gotowa'
+                          : 'Brak'}
+                  </strong>
+                </div>
+
+                <div className="folder-row">
+                  <code title={installStatus?.jarPath ?? ''}>
+                    {getInstallStatusText()}
+                  </code>
+
+                  <button
+                    type="button"
+                    className="small-button"
+                    disabled={installing || !versionReady || !gameDirectory}
+                    onClick={() => void installMinecraftClient()}
+                  >
+                    {installing
+                      ? 'Instalowanie...'
+                      : clientInstalled
+                        ? 'Sprawdź / napraw'
+                        : 'Zainstaluj'}
+                  </button>
+                </div>
+
+                {installStatus?.jarPath && (
+                  <div className="folder-row">
+                    <code title={installStatus.jarPath}>
+                      {installStatus.jarPath}
+                    </code>
+                  </div>
+                )}
+
+                {(installing || installProgress) && (
+                  <div style={{ marginTop: '16px' }}>
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        marginBottom: '7px',
+                        color:
+                          installProgress?.phase === 'error'
+                            ? '#ff8faf'
+                            : '#a99db0',
+                        fontSize: '9px'
+                      }}
+                    >
+                      <span>
+                        {installProgress?.message ?? 'Przygotowywanie...'}
+                      </span>
+                      <span>{installProgress?.percent ?? 0}%</span>
+                    </div>
+
+                    <div
+                      style={{
+                        height: '6px',
+                        overflow: 'hidden',
+                        background: 'rgba(255, 255, 255, 0.055)',
+                        borderRadius: '20px'
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: `${installProgress?.percent ?? 0}%`,
+                          height: '100%',
+                          background:
+                            'linear-gradient(90deg, #7c3aed, #a855f7)',
+                          transition: 'width 120ms ease'
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </article>
+
+              <article className="settings-card">
+                <div className="setting-top">
+                  <div>
                     <h2>Wersja Minecraft</h2>
                     <p>Dane pobierane z oficjalnego manifestu wersji.</p>
                   </div>
 
                   <strong>
-                    {minecraftLoading ? '...' : canPlay ? 'Gotowa' : 'Błąd'}
+                    {minecraftLoading
+                      ? '...'
+                      : versionReady
+                        ? 'Gotowa'
+                        : 'Błąd'}
                   </strong>
                 </div>
 
@@ -704,7 +1056,7 @@ function App(): React.JSX.Element {
                   <button
                     type="button"
                     className="small-button"
-                    disabled={minecraftLoading}
+                    disabled={minecraftLoading || installing}
                     onClick={() =>
                       void refreshMinecraftData(minecraftVersion, true)
                     }
@@ -883,7 +1235,7 @@ function App(): React.JSX.Element {
                   <button
                     type="button"
                     className="small-button"
-                    disabled={folderChoosing}
+                    disabled={folderChoosing || installing}
                     onClick={() => void chooseGameDirectory()}
                   >
                     {folderChoosing ? 'Otwieranie...' : 'Zmień'}
