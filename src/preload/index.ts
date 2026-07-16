@@ -13,11 +13,32 @@ interface JavaInfo {
 
 interface AuroraAPI {
   getJavaInfo: () => Promise<JavaInfo>
+  getDefaultGameDirectory: () => Promise<string>
+  chooseGameDirectory: (
+    currentPath: string | null
+  ) => Promise<string | null>
 }
 
 const api: AuroraAPI = {
   getJavaInfo: async (): Promise<JavaInfo> => {
-    return ipcRenderer.invoke('java:get-info') as Promise<JavaInfo>
+    return ipcRenderer.invoke(
+      'java:get-info'
+    ) as Promise<JavaInfo>
+  },
+
+  getDefaultGameDirectory: async (): Promise<string> => {
+    return ipcRenderer.invoke(
+      'folder:get-default-game-directory'
+    ) as Promise<string>
+  },
+
+  chooseGameDirectory: async (
+    currentPath: string | null
+  ): Promise<string | null> => {
+    return ipcRenderer.invoke(
+      'folder:choose-game-directory',
+      currentPath
+    ) as Promise<string | null>
   }
 }
 

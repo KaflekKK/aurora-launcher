@@ -12,6 +12,12 @@ interface JavaInfo {
 
 interface AuroraAPI {
   getJavaInfo: () => Promise<JavaInfo>
+
+  getDefaultGameDirectory: () => Promise<string>
+
+  chooseGameDirectory: (
+    currentPath: string | null
+  ) => Promise<string | null>
 }
 
 declare global {

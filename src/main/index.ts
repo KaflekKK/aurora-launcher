@@ -1,8 +1,16 @@
-import { app, shell, BrowserWindow, ipcMain } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  shell,
+  type OpenDialogOptions
+} from 'electron'
 import { execFile } from 'node:child_process'
-import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
-import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 
 const execFileAsync = promisify(execFile)
@@ -34,15 +42,17 @@ function getArchitectureName(): string {
 }
 
 function detectJavaVendor(output: string): string {
-  if (output.toLowerCase().includes('temurin')) {
+  const normalizedOutput = output.toLowerCase()
+
+  if (normalizedOutput.includes('temurin')) {
     return 'Eclipse Temurin'
   }
 
-  if (output.toLowerCase().includes('oracle')) {
+  if (normalizedOutput.includes('oracle')) {
     return 'Oracle Java'
   }
 
-  if (output.toLowerCase().includes('openjdk')) {
+  if (normalizedOutput.includes('openjdk')) {
     return 'OpenJDK'
   }
 
@@ -71,14 +81,10 @@ async function findJavaPath(): Promise<string | null> {
 
 async function detectJava(): Promise<JavaInfo> {
   try {
-    const { stdout, stderr } = await execFileAsync(
-      'java',
-      ['-version'],
-      {
-        windowsHide: true,
-        timeout: 10000
-      }
-    )
+    const { stdout, stderr } = await execFileAsync('java', ['-version'], {
+      windowsHide: true,
+      timeout: 10000
+    })
 
     const output = `${stdout}\n${stderr}`.trim()
 
@@ -119,6 +125,39 @@ async function detectJava(): Promise<JavaInfo> {
   }
 }
 
+function getDefaultGameDirectory(): string {
+  return join(app.getPath('appData'), 'AuroraLauncher')
+}
+
+async function chooseGameDirectory(
+  parentWindow: BrowserWindow | null,
+  currentPath: string | null
+): Promise<string | null> {
+  const defaultPath =
+    currentPath &&
+    isAbsolute(currentPath) &&
+    existsSync(currentPath)
+      ? currentPath
+      : app.getPath('appData')
+
+  const options: OpenDialogOptions = {
+    title: 'Wybierz folder gry Aurora Client',
+    buttonLabel: 'Wybierz folder',
+    defaultPath,
+    properties: ['openDirectory']
+  }
+
+  const result = parentWindow
+    ? await dialog.showOpenDialog(parentWindow, options)
+    : await dialog.showOpenDialog(options)
+
+  if (result.canceled) {
+    return null
+  }
+
+  return result.filePaths[0] ?? null
+}
+
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1100,
@@ -151,9 +190,7 @@ function createWindow(): void {
   })
 
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    void mainWindow.loadURL(
-      process.env['ELECTRON_RENDERER_URL']
-    )
+    void mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
     void mainWindow.loadFile(
       join(__dirname, '../renderer/index.html')
@@ -171,6 +208,22 @@ app.whenReady().then(() => {
   ipcMain.handle('java:get-info', async () => {
     return detectJava()
   })
+
+  ipcMain.handle('folder:get-default-game-directory', () => {
+    return getDefaultGameDirectory()
+  })
+
+  ipcMain.handle(
+    'folder:choose-game-directory',
+    async (event, currentPath: unknown) => {
+      const parentWindow = BrowserWindow.fromWebContents(event.sender)
+
+      const safeCurrentPath =
+        typeof currentPath === 'string' ? currentPath : null
+
+      return chooseGameDirectory(parentWindow, safeCurrentPath)
+    }
+  )
 
   createWindow()
 
