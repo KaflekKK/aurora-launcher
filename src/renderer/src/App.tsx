@@ -1,18 +1,7 @@
-import {
-  useCallback,
-  useEffect,
-  useState
-} from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
-type Page =
-  | 'home'
-  | 'profiles'
-  | 'settings'
-
-type MinecraftVersion =
-  | '1.21.11'
-  | '1.21.4'
-  | '1.20.1'
+type Page = 'home' | 'profiles' | 'settings'
+type MinecraftVersion = '1.21.11' | '1.21.4' | '1.20.1'
 
 interface LauncherSettings {
   minecraftVersion: MinecraftVersion
@@ -42,8 +31,35 @@ interface MinecraftVersionInfo {
   error: string | null
 }
 
-const SETTINGS_KEY =
-  'aurora-launcher-settings'
+interface MinecraftVersionDetails {
+  available: boolean
+  id: string
+  type: string | null
+  releaseTime: string | null
+  javaMajorVersion: number | null
+  javaComponent: string | null
+  mainClass: string | null
+  minimumLauncherVersion: number | null
+  clientUrl: string | null
+  clientSha1: string | null
+  clientSize: number | null
+  assetIndexId: string | null
+  assetIndexUrl: string | null
+  assetIndexSha1: string | null
+  assetIndexSize: number | null
+  assetTotalSize: number | null
+  libraryCount: number
+  gameArgumentCount: number
+  jvmArgumentCount: number
+  error: string | null
+}
+
+interface DetailItemProps {
+  label: string
+  value: string
+}
+
+const SETTINGS_KEY = 'aurora-launcher-settings'
 
 const DEFAULT_SETTINGS: LauncherSettings = {
   minecraftVersion: '1.21.11',
@@ -53,80 +69,54 @@ const DEFAULT_SETTINGS: LauncherSettings = {
   closeOnLaunch: false
 }
 
-function isMinecraftVersion(
-  value: unknown
-): value is MinecraftVersion {
-  return (
-    value === '1.21.11' ||
-    value === '1.21.4' ||
-    value === '1.20.1'
-  )
+function isMinecraftVersion(value: unknown): value is MinecraftVersion {
+  return value === '1.21.11' || value === '1.21.4' || value === '1.20.1'
 }
 
 function loadSettings(): LauncherSettings {
   try {
-    const savedSettings =
-      window.localStorage.getItem(
-        SETTINGS_KEY
-      )
+    const savedSettings = window.localStorage.getItem(SETTINGS_KEY)
 
     if (!savedSettings) {
       return DEFAULT_SETTINGS
     }
 
-    const parsedSettings = JSON.parse(
-      savedSettings
-    ) as Partial<LauncherSettings>
-
-    const ram =
-      typeof parsedSettings.ram ===
-        'number' &&
-      parsedSettings.ram >= 2 &&
-      parsedSettings.ram <= 16
-        ? Math.round(parsedSettings.ram)
-        : DEFAULT_SETTINGS.ram
+    const parsed = JSON.parse(savedSettings) as Partial<LauncherSettings>
 
     return {
-      minecraftVersion:
-        isMinecraftVersion(
-          parsedSettings.minecraftVersion
-        )
-          ? parsedSettings.minecraftVersion
-          : DEFAULT_SETTINGS.minecraftVersion,
+      minecraftVersion: isMinecraftVersion(parsed.minecraftVersion)
+        ? parsed.minecraftVersion
+        : DEFAULT_SETTINGS.minecraftVersion,
 
-      ram,
+      ram:
+        typeof parsed.ram === 'number' &&
+        parsed.ram >= 2 &&
+        parsed.ram <= 16
+          ? Math.round(parsed.ram)
+          : DEFAULT_SETTINGS.ram,
 
       gameDirectory:
-        typeof parsedSettings.gameDirectory ===
-        'string'
-          ? parsedSettings.gameDirectory
+        typeof parsed.gameDirectory === 'string'
+          ? parsed.gameDirectory
           : DEFAULT_SETTINGS.gameDirectory,
 
       minimizeOnLaunch:
-        typeof parsedSettings.minimizeOnLaunch ===
-        'boolean'
-          ? parsedSettings.minimizeOnLaunch
+        typeof parsed.minimizeOnLaunch === 'boolean'
+          ? parsed.minimizeOnLaunch
           : DEFAULT_SETTINGS.minimizeOnLaunch,
 
       closeOnLaunch:
-        typeof parsedSettings.closeOnLaunch ===
-        'boolean'
-          ? parsedSettings.closeOnLaunch
+        typeof parsed.closeOnLaunch === 'boolean'
+          ? parsed.closeOnLaunch
           : DEFAULT_SETTINGS.closeOnLaunch
     }
   } catch (error) {
-    console.error(
-      'Nie udało się odczytać ustawień:',
-      error
-    )
-
+    console.error('Nie udało się odczytać ustawień:', error)
     return DEFAULT_SETTINGS
   }
 }
 
-function formatReleaseDate(
-  value: string | null
-): string | null {
+function formatDate(value: string | null): string | null {
   if (!value) {
     return null
   }
@@ -137,210 +127,196 @@ function formatReleaseDate(
     return null
   }
 
-  return new Intl.DateTimeFormat(
-    'pl-PL',
-    {
-      dateStyle: 'medium'
-    }
-  ).format(date)
+  return new Intl.DateTimeFormat('pl-PL', {
+    dateStyle: 'medium'
+  }).format(date)
+}
+
+function formatBytes(value: number | null): string {
+  if (value === null || value < 0) {
+    return 'Brak danych'
+  }
+
+  if (value < 1024) {
+    return `${value} B`
+  }
+
+  const kilobytes = value / 1024
+
+  if (kilobytes < 1024) {
+    return `${kilobytes.toFixed(1)} KB`
+  }
+
+  const megabytes = kilobytes / 1024
+
+  if (megabytes < 1024) {
+    return `${megabytes.toFixed(1)} MB`
+  }
+
+  return `${(megabytes / 1024).toFixed(2)} GB`
+}
+
+function DetailItem({ label, value }: DetailItemProps): React.JSX.Element {
+  return (
+    <div
+      style={{
+        padding: '12px',
+        background: 'rgba(5, 4, 7, 0.42)',
+        border: '1px solid rgba(192, 132, 252, 0.09)',
+        borderRadius: '10px'
+      }}
+    >
+      <span
+        style={{
+          display: 'block',
+          marginBottom: '6px',
+          color: '#756a7c',
+          fontSize: '9px',
+          fontWeight: 700,
+          letterSpacing: '0.8px',
+          textTransform: 'uppercase'
+        }}
+      >
+        {label}
+      </span>
+
+      <strong
+        title={value}
+        style={{
+          display: 'block',
+          overflow: 'hidden',
+          color: '#e8e1ec',
+          fontSize: '11px',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap'
+        }}
+      >
+        {value}
+      </strong>
+    </div>
+  )
 }
 
 function App(): React.JSX.Element {
-  const [page, setPage] =
-    useState<Page>('home')
+  const [initialSettings] = useState<LauncherSettings>(() => loadSettings())
 
-  const [initialSettings] =
-    useState<LauncherSettings>(
-      () => loadSettings()
-    )
-
-  const [
-    minecraftVersion,
-    setMinecraftVersion
-  ] = useState<MinecraftVersion>(
-    initialSettings.minecraftVersion
-  )
-
-  const [ram, setRam] = useState(
-    initialSettings.ram
-  )
-
-  const [
-    gameDirectory,
-    setGameDirectory
-  ] = useState(
+  const [page, setPage] = useState<Page>('home')
+  const [minecraftVersion, setMinecraftVersion] =
+    useState<MinecraftVersion>(initialSettings.minecraftVersion)
+  const [ram, setRam] = useState(initialSettings.ram)
+  const [gameDirectory, setGameDirectory] = useState(
     initialSettings.gameDirectory
   )
-
-  const [
-    minimizeOnLaunch,
-    setMinimizeOnLaunch
-  ] = useState(
+  const [minimizeOnLaunch, setMinimizeOnLaunch] = useState(
     initialSettings.minimizeOnLaunch
   )
-
-  const [
-    closeOnLaunch,
-    setCloseOnLaunch
-  ] = useState(
+  const [closeOnLaunch, setCloseOnLaunch] = useState(
     initialSettings.closeOnLaunch
   )
 
-  const [javaInfo, setJavaInfo] =
-    useState<JavaInfo | null>(null)
+  const [javaInfo, setJavaInfo] = useState<JavaInfo | null>(null)
+  const [javaLoading, setJavaLoading] = useState(true)
 
-  const [javaLoading, setJavaLoading] =
-    useState(true)
+  const [versionInfo, setVersionInfo] =
+    useState<MinecraftVersionInfo | null>(null)
+  const [versionDetails, setVersionDetails] =
+    useState<MinecraftVersionDetails | null>(null)
+  const [minecraftLoading, setMinecraftLoading] = useState(true)
 
-  const [
-    versionInfo,
-    setVersionInfo
-  ] =
-    useState<MinecraftVersionInfo | null>(
-      null
-    )
+  const [folderChoosing, setFolderChoosing] = useState(false)
 
-  const [
-    versionLoading,
-    setVersionLoading
-  ] = useState(true)
+  const refreshJavaInfo = useCallback(async (): Promise<void> => {
+    setJavaLoading(true)
 
-  const [
-    folderChoosing,
-    setFolderChoosing
-  ] = useState(false)
+    try {
+      const result = await window.api.getJavaInfo()
+      setJavaInfo(result)
+    } catch (error) {
+      console.error('Nie udało się sprawdzić Javy:', error)
 
-  const refreshJavaInfo =
-    useCallback(
-      async (): Promise<void> => {
-        setJavaLoading(true)
+      setJavaInfo({
+        installed: false,
+        version: null,
+        fullVersion: null,
+        vendor: null,
+        path: null,
+        architecture: 'Nieznana',
+        error: 'Nie udało się połączyć z procesem Electron.'
+      })
+    } finally {
+      setJavaLoading(false)
+    }
+  }, [])
 
-        try {
-          const result =
-            await window.api.getJavaInfo()
+  const refreshMinecraftData = useCallback(
+    async (
+      version: MinecraftVersion,
+      forceRefresh = false
+    ): Promise<void> => {
+      setMinecraftLoading(true)
 
-          setJavaInfo(result)
-        } catch (error) {
-          console.error(
-            'Nie udało się sprawdzić Javy:',
-            error
-          )
+      try {
+        const [info, details] = await Promise.all([
+          window.api.checkMinecraftVersion(version, forceRefresh),
+          window.api.getMinecraftVersionDetails(version, forceRefresh)
+        ])
 
-          setJavaInfo({
-            installed: false,
-            version: null,
-            fullVersion: null,
-            vendor: null,
-            path: null,
-            architecture: 'Nieznana',
-            error:
-              'Nie udało się połączyć z procesem Electron.'
-          })
-        } finally {
-          setJavaLoading(false)
-        }
-      },
-      []
-    )
+        setVersionInfo(info)
+        setVersionDetails(details)
+      } catch (error) {
+        console.error('Nie udało się sprawdzić wersji Minecraft:', error)
 
-  const refreshVersionInfo =
-    useCallback(
-      async (
-        version: MinecraftVersion,
-        forceRefresh = false
-      ): Promise<void> => {
-        setVersionLoading(true)
+        setVersionInfo({
+          available: false,
+          id: version,
+          type: null,
+          releaseTime: null,
+          metadataUrl: null,
+          latestRelease: null,
+          error: 'Nie udało się połączyć z procesem Electron.'
+        })
 
-        try {
-          const result =
-            await window.api
-              .checkMinecraftVersion(
-                version,
-                forceRefresh
-              )
-
-          setVersionInfo(result)
-        } catch (error) {
-          console.error(
-            'Nie udało się sprawdzić wersji Minecraft:',
-            error
-          )
-
-          setVersionInfo({
-            available: false,
-            id: version,
-            type: null,
-            releaseTime: null,
-            metadataUrl: null,
-            latestRelease: null,
-            error:
-              'Nie udało się połączyć z procesem Electron.'
-          })
-        } finally {
-          setVersionLoading(false)
-        }
-      },
-      []
-    )
+        setVersionDetails(null)
+      } finally {
+        setMinecraftLoading(false)
+      }
+    },
+    []
+  )
 
   useEffect(() => {
     void refreshJavaInfo()
 
-    if (
-      !initialSettings.gameDirectory
-    ) {
+    if (!initialSettings.gameDirectory) {
       void window.api
         .getDefaultGameDirectory()
         .then((defaultDirectory) => {
-          setGameDirectory(
-            defaultDirectory
-          )
+          setGameDirectory(defaultDirectory)
         })
         .catch((error: unknown) => {
-          console.error(
-            'Nie udało się pobrać domyślnego folderu gry:',
-            error
-          )
+          console.error('Nie udało się pobrać folderu gry:', error)
         })
     }
-  }, [
-    initialSettings.gameDirectory,
-    refreshJavaInfo
-  ])
+  }, [initialSettings.gameDirectory, refreshJavaInfo])
 
   useEffect(() => {
-    void refreshVersionInfo(
-      minecraftVersion
-    )
-  }, [
-    minecraftVersion,
-    refreshVersionInfo
-  ])
+    void refreshMinecraftData(minecraftVersion)
+  }, [minecraftVersion, refreshMinecraftData])
 
   async function chooseGameDirectory(): Promise<void> {
     setFolderChoosing(true)
 
     try {
-      const selectedDirectory =
-        await window.api
-          .chooseGameDirectory(
-            gameDirectory || null
-          )
+      const selectedDirectory = await window.api.chooseGameDirectory(
+        gameDirectory || null
+      )
 
       if (selectedDirectory) {
-        setGameDirectory(
-          selectedDirectory
-        )
+        setGameDirectory(selectedDirectory)
       }
     } catch (error) {
-      console.error(
-        'Nie udało się otworzyć wyboru folderu:',
-        error
-      )
-
-      alert(
-        'Nie udało się otworzyć okna wyboru folderu.'
-      )
+      console.error('Nie udało się wybrać folderu:', error)
+      alert('Nie udało się otworzyć okna wyboru folderu.')
     } finally {
       setFolderChoosing(false)
     }
@@ -356,63 +332,46 @@ function App(): React.JSX.Element {
     }
 
     try {
-      window.localStorage.setItem(
-        SETTINGS_KEY,
-        JSON.stringify(settings)
-      )
+      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
 
       alert(
-        `Ustawienia zostały zapisane.\n\n` +
+        `Ustawienia zapisane.\n\n` +
           `Wersja: Minecraft ${minecraftVersion}\n` +
           `RAM: ${ram} GB\n` +
           `Folder: ${gameDirectory}`
       )
     } catch (error) {
-      console.error(
-        'Nie udało się zapisać ustawień:',
-        error
-      )
-
-      alert(
-        'Nie udało się zapisać ustawień.'
-      )
+      console.error('Nie udało się zapisać ustawień:', error)
+      alert('Nie udało się zapisać ustawień.')
     }
   }
 
   function playMinecraft(): void {
-    if (versionLoading) {
-      alert(
-        'Trwa sprawdzanie wersji Minecrafta.'
-      )
-
+    if (minecraftLoading) {
+      alert('Trwa pobieranie danych wersji Minecrafta.')
       return
     }
 
-    if (!versionInfo?.available) {
+    if (!versionInfo?.available || !versionDetails?.available) {
       alert(
-        `Nie można uruchomić Minecraft ${minecraftVersion}.\n\n` +
-          `${versionInfo?.error ?? 'Wersja jest niedostępna.'}`
+        `Nie można przygotować Minecraft ${minecraftVersion}.\n\n` +
+          `${
+            versionDetails?.error ??
+            versionInfo?.error ??
+            'Wersja jest niedostępna.'
+          }`
       )
-
       return
     }
 
     if (!javaInfo?.installed) {
-      alert(
-        'Nie wykryto Javy.\n\n' +
-          'Przejdź do ustawień i sprawdź konfigurację Javy.'
-      )
-
+      alert('Nie wykryto Javy. Sprawdź ustawienia.')
       setPage('settings')
       return
     }
 
     if (!gameDirectory) {
-      alert(
-        'Nie ustawiono folderu gry.\n\n' +
-          'Przejdź do ustawień i wybierz folder.'
-      )
-
+      alert('Nie ustawiono folderu gry.')
       setPage('settings')
       return
     }
@@ -422,57 +381,43 @@ function App(): React.JSX.Element {
         `Minecraft ${minecraftVersion}\n` +
         `RAM: ${ram} GB\n` +
         `Java: ${javaInfo.version ?? 'nieznana'}\n` +
-        `Folder: ${gameDirectory}\n\n` +
-        `Wersja została potwierdzona w manifeście Mojang.\n\n` +
-        `Pobieranie gry dodamy w następnym etapie.`
+        `Wymagana Java: ${
+          versionDetails.javaMajorVersion ?? 'brak danych'
+        }\n` +
+        `Biblioteki: ${versionDetails.libraryCount}\n\n` +
+        `Dane wersji są gotowe.`
     )
   }
 
   function getJavaDescription(): string {
     if (javaLoading) {
-      return (
-        'Sprawdzanie zainstalowanej Javy...'
-      )
+      return 'Sprawdzanie zainstalowanej Javy...'
     }
 
     if (!javaInfo?.installed) {
-      return (
-        javaInfo?.error ??
-        'Nie znaleziono Javy na komputerze.'
-      )
+      return javaInfo?.error ?? 'Nie znaleziono Javy.'
     }
 
     return (
       `${javaInfo.vendor ?? 'Java'} ` +
-      `${javaInfo.version ?? ''} · ` +
-      `${javaInfo.architecture}`
+      `${javaInfo.version ?? ''} · ${javaInfo.architecture}`
     )
   }
 
   function getVersionStatusText(): string {
-    if (versionLoading) {
-      return (
-        'Sprawdzanie manifestu Mojang...'
-      )
+    if (minecraftLoading) {
+      return 'Pobieranie danych wersji z Mojang...'
     }
 
     if (!versionInfo?.available) {
-      return (
-        versionInfo?.error ??
-        'Wersja jest niedostępna.'
-      )
+      return versionInfo?.error ?? 'Wersja jest niedostępna.'
     }
 
-    const releaseDate =
-      formatReleaseDate(
-        versionInfo.releaseTime
-      )
-
+    const releaseDate = formatDate(versionInfo.releaseTime)
     const versionType =
       versionInfo.type === 'release'
         ? 'wydanie stabilne'
-        : versionInfo.type ??
-          'nieznany typ'
+        : versionInfo.type ?? 'nieznany typ'
 
     return releaseDate
       ? `Dostępna · ${versionType} · ${releaseDate}`
@@ -480,8 +425,9 @@ function App(): React.JSX.Element {
   }
 
   const canPlay =
-    !versionLoading &&
-    versionInfo?.available === true
+    !minecraftLoading &&
+    versionInfo?.available === true &&
+    versionDetails?.available === true
 
   return (
     <div className="launcher">
@@ -495,86 +441,52 @@ function App(): React.JSX.Element {
           </div>
         </div>
 
-        <p className="menu-label">
-          MENU
-        </p>
+        <p className="menu-label">MENU</p>
 
         <nav className="menu">
           <button
             type="button"
-            className={
-              page === 'home'
-                ? 'menu-button active'
-                : 'menu-button'
-            }
-            onClick={() =>
-              setPage('home')
-            }
+            className={page === 'home' ? 'menu-button active' : 'menu-button'}
+            onClick={() => setPage('home')}
           >
-            <span className="menu-icon">
-              ⌂
-            </span>
-
+            <span className="menu-icon">⌂</span>
             Strona główna
           </button>
 
           <button
             type="button"
             className={
-              page === 'profiles'
-                ? 'menu-button active'
-                : 'menu-button'
+              page === 'profiles' ? 'menu-button active' : 'menu-button'
             }
-            onClick={() =>
-              setPage('profiles')
-            }
+            onClick={() => setPage('profiles')}
           >
-            <span className="menu-icon">
-              ▦
-            </span>
-
+            <span className="menu-icon">▦</span>
             Profile
           </button>
 
           <button
             type="button"
             className={
-              page === 'settings'
-                ? 'menu-button active'
-                : 'menu-button'
+              page === 'settings' ? 'menu-button active' : 'menu-button'
             }
-            onClick={() =>
-              setPage('settings')
-            }
+            onClick={() => setPage('settings')}
           >
-            <span className="menu-icon">
-              ⚙
-            </span>
-
+            <span className="menu-icon">⚙</span>
             Ustawienia
           </button>
         </nav>
 
         <div className="sidebar-bottom">
           <div className="account">
-            <div className="avatar">
-              ?
-            </div>
+            <div className="avatar">?</div>
 
             <div className="account-text">
-              <strong>
-                Nie zalogowano
-              </strong>
-
-              <span>
-                Konto Microsoft
-              </span>
+              <strong>Nie zalogowano</strong>
+              <span>Konto Microsoft</span>
             </div>
           </div>
 
-          <span className="app-version">
-            Aurora Launcher v0.5.0
-          </span>
+          <span className="app-version">Aurora Launcher v0.6.0</span>
         </div>
       </aside>
 
@@ -583,9 +495,9 @@ function App(): React.JSX.Element {
           <div className="status">
             <span className="status-dot" />
 
-            {versionLoading
-              ? 'Sprawdzanie wersji'
-              : versionInfo?.available
+            {minecraftLoading
+              ? 'Pobieranie danych wersji'
+              : canPlay
                 ? 'Launcher gotowy'
                 : 'Problem z wersją'}
           </div>
@@ -593,11 +505,7 @@ function App(): React.JSX.Element {
           <button
             type="button"
             className="login-button"
-            onClick={() =>
-              alert(
-                'Logowanie Microsoft dodamy później.'
-              )
-            }
+            onClick={() => alert('Logowanie Microsoft dodamy później.')}
           >
             Zaloguj się
           </button>
@@ -614,108 +522,65 @@ function App(): React.JSX.Element {
               <h1>
                 Zagraj po
                 <br />
-
-                <strong>
-                  swojemu.
-                </strong>
+                <strong>swojemu.</strong>
               </h1>
 
               <p>
-                Nowoczesny, szybki i lekki
-                launcher Minecraft. Wszystkie
-                profile, ustawienia i mody
-                w jednym miejscu.
+                Nowoczesny, szybki i lekki launcher Minecraft. Wszystkie
+                profile, ustawienia i mody w jednym miejscu.
               </p>
 
               <div className="features">
                 <div className="feature">
-                  <strong>
-                    Szybki
-                  </strong>
-
-                  <span>
-                    Proste uruchamianie gry
-                  </span>
+                  <strong>Szybki</strong>
+                  <span>Proste uruchamianie gry</span>
                 </div>
 
                 <div className="feature">
-                  <strong>
-                    Bezpieczny
-                  </strong>
-
-                  <span>
-                    Logowanie przez Microsoft
-                  </span>
+                  <strong>Bezpieczny</strong>
+                  <span>Logowanie przez Microsoft</span>
                 </div>
 
                 <div className="feature">
-                  <strong>
-                    Nowoczesny
-                  </strong>
-
-                  <span>
-                    Własny klient i mody
-                  </span>
+                  <strong>Nowoczesny</strong>
+                  <span>Własny klient i mody</span>
                 </div>
               </div>
             </div>
 
             <div className="play-panel">
               <div className="selected-profile">
-                <div className="profile-logo">
-                  A
-                </div>
+                <div className="profile-logo">A</div>
 
                 <div>
-                  <span className="small-label">
-                    WYBRANY PROFIL
-                  </span>
-
+                  <span className="small-label">WYBRANY PROFIL</span>
                   <h2>Aurora Client</h2>
-
-                  <p>
-                    Minecraft Java Edition
-                  </p>
+                  <p>Minecraft Java Edition</p>
                 </div>
               </div>
 
               <div className="version-control">
-                <label htmlFor="minecraft-version">
-                  Wersja gry
-                </label>
+                <label htmlFor="minecraft-version">Wersja gry</label>
 
                 <select
                   id="minecraft-version"
                   value={minecraftVersion}
                   onChange={(event) =>
                     setMinecraftVersion(
-                      event.target
-                        .value as MinecraftVersion
+                      event.target.value as MinecraftVersion
                     )
                   }
                 >
-                  <option value="1.21.11">
-                    Minecraft 1.21.11
-                  </option>
-
-                  <option value="1.21.4">
-                    Minecraft 1.21.4
-                  </option>
-
-                  <option value="1.20.1">
-                    Minecraft 1.20.1
-                  </option>
+                  <option value="1.21.11">Minecraft 1.21.11</option>
+                  <option value="1.21.4">Minecraft 1.21.4</option>
+                  <option value="1.20.1">Minecraft 1.20.1</option>
                 </select>
 
                 <span
-                  title={
-                    versionInfo?.error ??
-                    undefined
-                  }
                   style={{
-                    color: versionLoading
+                    color: minecraftLoading
                       ? '#8d8195'
-                      : versionInfo?.available
+                      : canPlay
                         ? '#c084fc'
                         : '#ff8faf',
                     fontSize: '9px',
@@ -732,12 +597,8 @@ function App(): React.JSX.Element {
                 disabled={!canPlay}
                 onClick={playMinecraft}
                 style={{
-                  opacity: canPlay
-                    ? 1
-                    : 0.5,
-                  cursor: canPlay
-                    ? 'pointer'
-                    : 'not-allowed'
+                  opacity: canPlay ? 1 : 0.5,
+                  cursor: canPlay ? 'pointer' : 'not-allowed'
                 }}
               >
                 <span>▶</span>
@@ -751,26 +612,15 @@ function App(): React.JSX.Element {
           <section className="normal-page">
             <div className="page-header">
               <div>
-                <span className="small-label">
-                  ZARZĄDZANIE
-                </span>
-
+                <span className="small-label">ZARZĄDZANIE</span>
                 <h1>Profile gry</h1>
-
-                <p>
-                  Wybierz wersję Minecrafta
-                  oraz zestaw modyfikacji.
-                </p>
+                <p>Wybierz wersję Minecrafta oraz zestaw modyfikacji.</p>
               </div>
 
               <button
                 type="button"
                 className="secondary-button"
-                onClick={() =>
-                  alert(
-                    'Tworzenie profili dodamy później.'
-                  )
-                }
+                onClick={() => alert('Tworzenie profili dodamy później.')}
               >
                 + Nowy profil
               </button>
@@ -778,73 +628,48 @@ function App(): React.JSX.Element {
 
             <div className="profiles">
               <article className="profile-card selected-card">
-                <div className="card-logo">
-                  A
-                </div>
+                <div className="card-logo">A</div>
 
                 <div className="card-text">
                   <h2>Aurora Client</h2>
-
-                  <p>
-                    Minecraft{' '}
-                    {minecraftVersion} · Profil
-                    domyślny
-                  </p>
+                  <p>Minecraft {minecraftVersion} · Profil domyślny</p>
                 </div>
 
                 <span className="active-badge">
-                  {versionLoading
+                  {minecraftLoading
                     ? 'SPRAWDZANIE'
-                    : versionInfo?.available
+                    : canPlay
                       ? 'DOSTĘPNY'
                       : 'BŁĄD'}
                 </span>
               </article>
 
               <article className="profile-card">
-                <div className="card-logo dark-logo">
-                  V
-                </div>
+                <div className="card-logo dark-logo">V</div>
 
                 <div className="card-text">
                   <h2>Vanilla</h2>
-
-                  <p>
-                    Czysty Minecraft bez
-                    dodatkowych modyfikacji
-                  </p>
+                  <p>Czysty Minecraft bez dodatkowych modyfikacji</p>
                 </div>
 
                 <button
                   type="button"
                   className="small-button"
-                  onClick={() =>
-                    alert(
-                      'Wybrano profil Vanilla.'
-                    )
-                  }
+                  onClick={() => alert('Wybrano profil Vanilla.')}
                 >
                   Wybierz
                 </button>
               </article>
 
               <article className="profile-card unavailable">
-                <div className="card-logo dark-logo">
-                  F
-                </div>
+                <div className="card-logo dark-logo">F</div>
 
                 <div className="card-text">
                   <h2>Fabric</h2>
-
-                  <p>
-                    Profil przygotowany do
-                    obsługi modów
-                  </p>
+                  <p>Profil przygotowany do obsługi modów</p>
                 </div>
 
-                <span className="soon-badge">
-                  WKRÓTCE
-                </span>
+                <span className="soon-badge">WKRÓTCE</span>
               </article>
             </div>
           </section>
@@ -854,16 +679,9 @@ function App(): React.JSX.Element {
           <section className="normal-page">
             <div className="page-header">
               <div>
-                <span className="small-label">
-                  KONFIGURACJA
-                </span>
-
+                <span className="small-label">KONFIGURACJA</span>
                 <h1>Ustawienia</h1>
-
-                <p>
-                  Dostosuj działanie
-                  Minecrafta i launchera.
-                </p>
+                <p>Dostosuj działanie Minecrafta i launchera.</p>
               </div>
             </div>
 
@@ -871,44 +689,27 @@ function App(): React.JSX.Element {
               <article className="settings-card">
                 <div className="setting-top">
                   <div>
-                    <h2>
-                      Wersja Minecraft
-                    </h2>
-
-                    <p>
-                      Sprawdzanie wersji
-                      w oficjalnym manifeście.
-                    </p>
+                    <h2>Wersja Minecraft</h2>
+                    <p>Dane pobierane z oficjalnego manifestu wersji.</p>
                   </div>
 
                   <strong>
-                    {versionLoading
-                      ? '...'
-                      : versionInfo?.available
-                        ? 'Dostępna'
-                        : 'Błąd'}
+                    {minecraftLoading ? '...' : canPlay ? 'Gotowa' : 'Błąd'}
                   </strong>
                 </div>
 
                 <div className="folder-row">
-                  <code>
-                    {getVersionStatusText()}
-                  </code>
+                  <code>{getVersionStatusText()}</code>
 
                   <button
                     type="button"
                     className="small-button"
-                    disabled={versionLoading}
+                    disabled={minecraftLoading}
                     onClick={() =>
-                      void refreshVersionInfo(
-                        minecraftVersion,
-                        true
-                      )
+                      void refreshMinecraftData(minecraftVersion, true)
                     }
                   >
-                    {versionLoading
-                      ? 'Sprawdzanie'
-                      : 'Sprawdź ponownie'}
+                    {minecraftLoading ? 'Sprawdzanie' : 'Odśwież dane'}
                   </button>
                 </div>
               </article>
@@ -916,18 +717,102 @@ function App(): React.JSX.Element {
               <article className="settings-card">
                 <div className="setting-top">
                   <div>
-                    <h2>Pamięć RAM</h2>
-
-                    <p>
-                      Ilość pamięci
-                      przydzielonej dla
-                      Minecrafta.
-                    </p>
+                    <h2>Szczegóły wersji</h2>
+                    <p>Dane potrzebne do pobrania i uruchomienia gry.</p>
                   </div>
 
                   <strong>
-                    {ram} GB
+                    {versionDetails?.available ? minecraftVersion : 'Brak'}
                   </strong>
+                </div>
+
+                {minecraftLoading ? (
+                  <div className="folder-row">
+                    <code>Pobieranie szczegółowych danych...</code>
+                  </div>
+                ) : versionDetails?.available ? (
+                  <>
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                        gap: '10px',
+                        marginTop: '18px'
+                      }}
+                    >
+                      <DetailItem
+                        label="Wymagana Java"
+                        value={
+                          versionDetails.javaMajorVersion
+                            ? `Java ${versionDetails.javaMajorVersion}`
+                            : 'Brak danych'
+                        }
+                      />
+
+                      <DetailItem
+                        label="Plik klienta"
+                        value={formatBytes(versionDetails.clientSize)}
+                      />
+
+                      <DetailItem
+                        label="Biblioteki"
+                        value={`${versionDetails.libraryCount}`}
+                      />
+
+                      <DetailItem
+                        label="Assety"
+                        value={
+                          versionDetails.assetIndexId
+                            ? `${versionDetails.assetIndexId} · ${formatBytes(
+                                versionDetails.assetTotalSize
+                              )}`
+                            : 'Brak danych'
+                        }
+                      />
+
+                      <DetailItem
+                        label="Argumenty gry"
+                        value={`${versionDetails.gameArgumentCount}`}
+                      />
+
+                      <DetailItem
+                        label="Argumenty JVM"
+                        value={`${versionDetails.jvmArgumentCount}`}
+                      />
+                    </div>
+
+                    <div className="folder-row">
+                      <code title={versionDetails.mainClass ?? ''}>
+                        Klasa startowa:{' '}
+                        {versionDetails.mainClass ?? 'Brak danych'}
+                      </code>
+                    </div>
+
+                    <div className="folder-row">
+                      <code title={versionDetails.clientSha1 ?? ''}>
+                        SHA-1 klienta:{' '}
+                        {versionDetails.clientSha1 ?? 'Brak danych'}
+                      </code>
+                    </div>
+                  </>
+                ) : (
+                  <div className="folder-row">
+                    <code>
+                      {versionDetails?.error ??
+                        'Nie udało się pobrać szczegółów.'}
+                    </code>
+                  </div>
+                )}
+              </article>
+
+              <article className="settings-card">
+                <div className="setting-top">
+                  <div>
+                    <h2>Pamięć RAM</h2>
+                    <p>Ilość pamięci przydzielonej dla Minecrafta.</p>
+                  </div>
+
+                  <strong>{ram} GB</strong>
                 </div>
 
                 <input
@@ -937,13 +822,7 @@ function App(): React.JSX.Element {
                   max="16"
                   step="1"
                   value={ram}
-                  onChange={(event) =>
-                    setRam(
-                      Number(
-                        event.target.value
-                      )
-                    )
-                  }
+                  onChange={(event) => setRam(Number(event.target.value))}
                 />
 
                 <div className="ram-values">
@@ -956,11 +835,7 @@ function App(): React.JSX.Element {
                 <div className="setting-top">
                   <div>
                     <h2>Java</h2>
-
-                    <p>
-                      Java używana do
-                      uruchamiania Minecrafta.
-                    </p>
+                    <p>Java używana do uruchamiania Minecrafta.</p>
                   </div>
 
                   <strong>
@@ -973,29 +848,21 @@ function App(): React.JSX.Element {
                 </div>
 
                 <div className="folder-row">
-                  <code>
-                    {getJavaDescription()}
-                  </code>
+                  <code>{getJavaDescription()}</code>
 
                   <button
                     type="button"
                     className="small-button"
                     disabled={javaLoading}
-                    onClick={() =>
-                      void refreshJavaInfo()
-                    }
+                    onClick={() => void refreshJavaInfo()}
                   >
-                    {javaLoading
-                      ? 'Sprawdzanie'
-                      : 'Sprawdź ponownie'}
+                    {javaLoading ? 'Sprawdzanie' : 'Sprawdź ponownie'}
                   </button>
                 </div>
 
                 {javaInfo?.path && (
                   <div className="folder-row">
-                    <code>
-                      {javaInfo.path}
-                    </code>
+                    <code>{javaInfo.path}</code>
                   </div>
                 )}
               </article>
@@ -1004,31 +871,22 @@ function App(): React.JSX.Element {
                 <div className="setting-top">
                   <div>
                     <h2>Folder gry</h2>
-
-                    <p>
-                      Miejsce przechowywania
-                      plików Aurora Client.
-                    </p>
+                    <p>Miejsce przechowywania plików Aurora Client.</p>
                   </div>
                 </div>
 
                 <div className="folder-row">
                   <code title={gameDirectory}>
-                    {gameDirectory ||
-                      'Ładowanie domyślnego folderu...'}
+                    {gameDirectory || 'Ładowanie domyślnego folderu...'}
                   </code>
 
                   <button
                     type="button"
                     className="small-button"
                     disabled={folderChoosing}
-                    onClick={() =>
-                      void chooseGameDirectory()
-                    }
+                    onClick={() => void chooseGameDirectory()}
                   >
-                    {folderChoosing
-                      ? 'Otwieranie...'
-                      : 'Zmień'}
+                    {folderChoosing ? 'Otwieranie...' : 'Zmień'}
                   </button>
                 </div>
               </article>
@@ -1036,54 +894,31 @@ function App(): React.JSX.Element {
               <article className="settings-card">
                 <div className="setting-top">
                   <div>
-                    <h2>
-                      Zachowanie launchera
-                    </h2>
-
-                    <p>
-                      Wybierz, co ma się
-                      wydarzyć po uruchomieniu
-                      gry.
-                    </p>
+                    <h2>Zachowanie launchera</h2>
+                    <p>Wybierz zachowanie po uruchomieniu gry.</p>
                   </div>
                 </div>
 
                 <label className="check-row">
                   <input
                     type="checkbox"
-                    checked={
-                      minimizeOnLaunch
-                    }
+                    checked={minimizeOnLaunch}
                     onChange={(event) =>
-                      setMinimizeOnLaunch(
-                        event.target.checked
-                      )
+                      setMinimizeOnLaunch(event.target.checked)
                     }
                   />
-
-                  <span>
-                    Minimalizuj launcher po
-                    uruchomieniu gry
-                  </span>
+                  <span>Minimalizuj launcher po uruchomieniu gry</span>
                 </label>
 
                 <label className="check-row">
                   <input
                     type="checkbox"
-                    checked={
-                      closeOnLaunch
-                    }
+                    checked={closeOnLaunch}
                     onChange={(event) =>
-                      setCloseOnLaunch(
-                        event.target.checked
-                      )
+                      setCloseOnLaunch(event.target.checked)
                     }
                   />
-
-                  <span>
-                    Zamknij launcher po
-                    uruchomieniu gry
-                  </span>
+                  <span>Zamknij launcher po uruchomieniu gry</span>
                 </label>
               </article>
             </div>
