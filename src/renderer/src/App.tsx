@@ -1,13 +1,27 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 type Page = 'home' | 'profiles' | 'settings'
-type MinecraftVersion = '1.21.11' | '1.21.4' | '1.20.1'
+
+type MinecraftVersion =
+  | '1.21.11'
+  | '1.21.4'
+  | '1.20.1'
 
 interface LauncherSettings {
   minecraftVersion: MinecraftVersion
   ram: number
   minimizeOnLaunch: boolean
   closeOnLaunch: boolean
+}
+
+interface JavaInfo {
+  installed: boolean
+  version: string | null
+  fullVersion: string | null
+  vendor: string | null
+  path: string | null
+  architecture: string
+  error: string | null
 }
 
 const SETTINGS_KEY = 'aurora-launcher-settings'
@@ -19,13 +33,20 @@ const DEFAULT_SETTINGS: LauncherSettings = {
   closeOnLaunch: false
 }
 
-function isMinecraftVersion(value: unknown): value is MinecraftVersion {
-  return value === '1.21.11' || value === '1.21.4' || value === '1.20.1'
+function isMinecraftVersion(
+  value: unknown
+): value is MinecraftVersion {
+  return (
+    value === '1.21.11' ||
+    value === '1.21.4' ||
+    value === '1.20.1'
+  )
 }
 
 function loadSettings(): LauncherSettings {
   try {
-    const savedSettings = window.localStorage.getItem(SETTINGS_KEY)
+    const savedSettings =
+      window.localStorage.getItem(SETTINGS_KEY)
 
     if (!savedSettings) {
       return DEFAULT_SETTINGS
@@ -52,37 +73,89 @@ function loadSettings(): LauncherSettings {
       ram,
 
       minimizeOnLaunch:
-        typeof parsedSettings.minimizeOnLaunch === 'boolean'
+        typeof parsedSettings.minimizeOnLaunch ===
+        'boolean'
           ? parsedSettings.minimizeOnLaunch
           : DEFAULT_SETTINGS.minimizeOnLaunch,
 
       closeOnLaunch:
-        typeof parsedSettings.closeOnLaunch === 'boolean'
+        typeof parsedSettings.closeOnLaunch ===
+        'boolean'
           ? parsedSettings.closeOnLaunch
           : DEFAULT_SETTINGS.closeOnLaunch
     }
   } catch (error) {
-    console.error('Nie udało się odczytać ustawień:', error)
+    console.error(
+      'Nie udało się odczytać ustawień:',
+      error
+    )
+
     return DEFAULT_SETTINGS
   }
 }
 
 function App(): React.JSX.Element {
   const [page, setPage] = useState<Page>('home')
-  const [initialSettings] = useState<LauncherSettings>(() => loadSettings())
+
+  const [initialSettings] =
+    useState<LauncherSettings>(() => loadSettings())
 
   const [minecraftVersion, setMinecraftVersion] =
-    useState<MinecraftVersion>(initialSettings.minecraftVersion)
+    useState<MinecraftVersion>(
+      initialSettings.minecraftVersion
+    )
 
-  const [ram, setRam] = useState(initialSettings.ram)
-
-  const [minimizeOnLaunch, setMinimizeOnLaunch] = useState(
-    initialSettings.minimizeOnLaunch
+  const [ram, setRam] = useState(
+    initialSettings.ram
   )
 
-  const [closeOnLaunch, setCloseOnLaunch] = useState(
-    initialSettings.closeOnLaunch
-  )
+  const [
+    minimizeOnLaunch,
+    setMinimizeOnLaunch
+  ] = useState(initialSettings.minimizeOnLaunch)
+
+  const [
+    closeOnLaunch,
+    setCloseOnLaunch
+  ] = useState(initialSettings.closeOnLaunch)
+
+  const [javaInfo, setJavaInfo] =
+    useState<JavaInfo | null>(null)
+
+  const [javaLoading, setJavaLoading] =
+    useState(true)
+
+  async function refreshJavaInfo(): Promise<void> {
+    setJavaLoading(true)
+
+    try {
+      const result =
+        await window.api.getJavaInfo()
+
+      setJavaInfo(result)
+    } catch (error) {
+      console.error(
+        'Nie udało się sprawdzić Javy:',
+        error
+      )
+
+      setJavaInfo({
+        installed: false,
+        version: null,
+        fullVersion: null,
+        vendor: null,
+        path: null,
+        architecture: 'Nieznana',
+        error: 'Nie udało się połączyć z procesem Electron.'
+      })
+    } finally {
+      setJavaLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void refreshJavaInfo()
+  }, [])
 
   function saveSettings(): void {
     const settings: LauncherSettings = {
@@ -104,18 +177,53 @@ function App(): React.JSX.Element {
           `RAM: ${ram} GB`
       )
     } catch (error) {
-      console.error('Nie udało się zapisać ustawień:', error)
+      console.error(
+        'Nie udało się zapisać ustawień:',
+        error
+      )
 
-      alert('Nie udało się zapisać ustawień.')
+      alert(
+        'Nie udało się zapisać ustawień.'
+      )
     }
   }
 
   function playMinecraft(): void {
+    if (!javaInfo?.installed) {
+      alert(
+        'Nie wykryto Javy.\n\n' +
+          'Przejdź do ustawień i sprawdź konfigurację Javy.'
+      )
+
+      setPage('settings')
+      return
+    }
+
     alert(
       `Aurora Client\n` +
         `Minecraft ${minecraftVersion}\n` +
-        `RAM: ${ram} GB\n\n` +
+        `RAM: ${ram} GB\n` +
+        `Java: ${javaInfo.version ?? 'nieznana'}\n\n` +
         `Prawdziwe uruchamianie gry dodamy później.`
+    )
+  }
+
+  function getJavaDescription(): string {
+    if (javaLoading) {
+      return 'Sprawdzanie zainstalowanej Javy...'
+    }
+
+    if (!javaInfo?.installed) {
+      return (
+        javaInfo?.error ??
+        'Nie znaleziono Javy na komputerze.'
+      )
+    }
+
+    return (
+      `${javaInfo.vendor ?? 'Java'} ` +
+      `${javaInfo.version ?? ''} · ` +
+      `${javaInfo.architecture}`
     )
   }
 
@@ -143,7 +251,10 @@ function App(): React.JSX.Element {
             }
             onClick={() => setPage('home')}
           >
-            <span className="menu-icon">⌂</span>
+            <span className="menu-icon">
+              ⌂
+            </span>
+
             Strona główna
           </button>
 
@@ -154,9 +265,14 @@ function App(): React.JSX.Element {
                 ? 'menu-button active'
                 : 'menu-button'
             }
-            onClick={() => setPage('profiles')}
+            onClick={() =>
+              setPage('profiles')
+            }
           >
-            <span className="menu-icon">▦</span>
+            <span className="menu-icon">
+              ▦
+            </span>
+
             Profile
           </button>
 
@@ -167,9 +283,14 @@ function App(): React.JSX.Element {
                 ? 'menu-button active'
                 : 'menu-button'
             }
-            onClick={() => setPage('settings')}
+            onClick={() =>
+              setPage('settings')
+            }
           >
-            <span className="menu-icon">⚙</span>
+            <span className="menu-icon">
+              ⚙
+            </span>
+
             Ustawienia
           </button>
         </nav>
@@ -179,13 +300,18 @@ function App(): React.JSX.Element {
             <div className="avatar">?</div>
 
             <div className="account-text">
-              <strong>Nie zalogowano</strong>
-              <span>Konto Microsoft</span>
+              <strong>
+                Nie zalogowano
+              </strong>
+
+              <span>
+                Konto Microsoft
+              </span>
             </div>
           </div>
 
           <span className="app-version">
-            Aurora Launcher v0.2.0
+            Aurora Launcher v0.3.0
           </span>
         </div>
       </aside>
@@ -202,7 +328,7 @@ function App(): React.JSX.Element {
             className="login-button"
             onClick={() =>
               alert(
-                'Logowanie Microsoft dodamy w późniejszym etapie.'
+                'Logowanie Microsoft dodamy później.'
               )
             }
           >
@@ -221,36 +347,55 @@ function App(): React.JSX.Element {
               <h1>
                 Zagraj po
                 <br />
-                <strong>swojemu.</strong>
+
+                <strong>
+                  swojemu.
+                </strong>
               </h1>
 
               <p>
-                Nowoczesny, szybki i lekki launcher Minecraft.
-                Wszystkie profile, ustawienia i mody w jednym
-                miejscu.
+                Nowoczesny, szybki i lekki
+                launcher Minecraft. Wszystkie
+                profile, ustawienia i mody
+                w jednym miejscu.
               </p>
 
               <div className="features">
                 <div className="feature">
                   <strong>Szybki</strong>
-                  <span>Proste uruchamianie gry</span>
+
+                  <span>
+                    Proste uruchamianie gry
+                  </span>
                 </div>
 
                 <div className="feature">
-                  <strong>Bezpieczny</strong>
-                  <span>Logowanie przez Microsoft</span>
+                  <strong>
+                    Bezpieczny
+                  </strong>
+
+                  <span>
+                    Logowanie przez Microsoft
+                  </span>
                 </div>
 
                 <div className="feature">
-                  <strong>Nowoczesny</strong>
-                  <span>Własny klient i mody</span>
+                  <strong>
+                    Nowoczesny
+                  </strong>
+
+                  <span>
+                    Własny klient i mody
+                  </span>
                 </div>
               </div>
             </div>
 
             <div className="play-panel">
               <div className="selected-profile">
-                <div className="profile-logo">A</div>
+                <div className="profile-logo">
+                  A
+                </div>
 
                 <div>
                   <span className="small-label">
@@ -258,7 +403,10 @@ function App(): React.JSX.Element {
                   </span>
 
                   <h2>Aurora Client</h2>
-                  <p>Minecraft Java Edition</p>
+
+                  <p>
+                    Minecraft Java Edition
+                  </p>
                 </div>
               </div>
 
@@ -272,7 +420,8 @@ function App(): React.JSX.Element {
                   value={minecraftVersion}
                   onChange={(event) =>
                     setMinecraftVersion(
-                      event.target.value as MinecraftVersion
+                      event.target
+                        .value as MinecraftVersion
                     )
                   }
                 >
@@ -313,8 +462,8 @@ function App(): React.JSX.Element {
                 <h1>Profile gry</h1>
 
                 <p>
-                  Wybierz wersję Minecrafta oraz zestaw
-                  modyfikacji.
+                  Wybierz wersję Minecrafta
+                  oraz zestaw modyfikacji.
                 </p>
               </div>
 
@@ -322,7 +471,9 @@ function App(): React.JSX.Element {
                 type="button"
                 className="secondary-button"
                 onClick={() =>
-                  alert('Tworzenie profili dodamy później.')
+                  alert(
+                    'Tworzenie profili dodamy później.'
+                  )
                 }
               >
                 + Nowy profil
@@ -331,28 +482,36 @@ function App(): React.JSX.Element {
 
             <div className="profiles">
               <article className="profile-card selected-card">
-                <div className="card-logo">A</div>
+                <div className="card-logo">
+                  A
+                </div>
 
                 <div className="card-text">
                   <h2>Aurora Client</h2>
 
                   <p>
-                    Minecraft {minecraftVersion} · Profil
+                    Minecraft{' '}
+                    {minecraftVersion} · Profil
                     domyślny
                   </p>
                 </div>
 
-                <span className="active-badge">AKTYWNY</span>
+                <span className="active-badge">
+                  AKTYWNY
+                </span>
               </article>
 
               <article className="profile-card">
-                <div className="card-logo dark-logo">V</div>
+                <div className="card-logo dark-logo">
+                  V
+                </div>
 
                 <div className="card-text">
                   <h2>Vanilla</h2>
 
                   <p>
-                    Czysty Minecraft bez dodatkowych modyfikacji
+                    Czysty Minecraft bez
+                    dodatkowych modyfikacji
                   </p>
                 </div>
 
@@ -360,7 +519,9 @@ function App(): React.JSX.Element {
                   type="button"
                   className="small-button"
                   onClick={() =>
-                    alert('Wybrano profil Vanilla.')
+                    alert(
+                      'Wybrano profil Vanilla.'
+                    )
                   }
                 >
                   Wybierz
@@ -368,14 +529,22 @@ function App(): React.JSX.Element {
               </article>
 
               <article className="profile-card unavailable">
-                <div className="card-logo dark-logo">F</div>
+                <div className="card-logo dark-logo">
+                  F
+                </div>
 
                 <div className="card-text">
                   <h2>Fabric</h2>
-                  <p>Profil przygotowany do obsługi modów</p>
+
+                  <p>
+                    Profil przygotowany do
+                    obsługi modów
+                  </p>
                 </div>
 
-                <span className="soon-badge">WKRÓTCE</span>
+                <span className="soon-badge">
+                  WKRÓTCE
+                </span>
               </article>
             </div>
           </section>
@@ -392,7 +561,8 @@ function App(): React.JSX.Element {
                 <h1>Ustawienia</h1>
 
                 <p>
-                  Dostosuj działanie Minecrafta i launchera.
+                  Dostosuj działanie
+                  Minecrafta i launchera.
                 </p>
               </div>
             </div>
@@ -404,11 +574,15 @@ function App(): React.JSX.Element {
                     <h2>Pamięć RAM</h2>
 
                     <p>
-                      Ilość pamięci przydzielonej dla Minecrafta.
+                      Ilość pamięci
+                      przydzielonej dla
+                      Minecrafta.
                     </p>
                   </div>
 
-                  <strong>{ram} GB</strong>
+                  <strong>
+                    {ram} GB
+                  </strong>
                 </div>
 
                 <input
@@ -419,7 +593,11 @@ function App(): React.JSX.Element {
                   step="1"
                   value={ram}
                   onChange={(event) =>
-                    setRam(Number(event.target.value))
+                    setRam(
+                      Number(
+                        event.target.value
+                      )
+                    )
                   }
                 />
 
@@ -432,17 +610,67 @@ function App(): React.JSX.Element {
               <article className="settings-card">
                 <div className="setting-top">
                   <div>
+                    <h2>Java</h2>
+
+                    <p>
+                      Java używana do
+                      uruchamiania Minecrafta.
+                    </p>
+                  </div>
+
+                  <strong>
+                    {javaLoading
+                      ? '...'
+                      : javaInfo?.installed
+                        ? 'Wykryta'
+                        : 'Brak'}
+                  </strong>
+                </div>
+
+                <div className="folder-row">
+                  <code>
+                    {getJavaDescription()}
+                  </code>
+
+                  <button
+                    type="button"
+                    className="small-button"
+                    disabled={javaLoading}
+                    onClick={() =>
+                      void refreshJavaInfo()
+                    }
+                  >
+                    {javaLoading
+                      ? 'Sprawdzanie'
+                      : 'Sprawdź ponownie'}
+                  </button>
+                </div>
+
+                {javaInfo?.path && (
+                  <div className="folder-row">
+                    <code>
+                      {javaInfo.path}
+                    </code>
+                  </div>
+                )}
+              </article>
+
+              <article className="settings-card">
+                <div className="setting-top">
+                  <div>
                     <h2>Folder gry</h2>
 
                     <p>
-                      Miejsce przechowywania plików Aurora
-                      Client.
+                      Miejsce przechowywania
+                      plików Aurora Client.
                     </p>
                   </div>
                 </div>
 
                 <div className="folder-row">
-                  <code>%APPDATA%\AuroraLauncher</code>
+                  <code>
+                    %APPDATA%\AuroraLauncher
+                  </code>
 
                   <button
                     type="button"
@@ -461,10 +689,13 @@ function App(): React.JSX.Element {
               <article className="settings-card">
                 <div className="setting-top">
                   <div>
-                    <h2>Zachowanie launchera</h2>
+                    <h2>
+                      Zachowanie launchera
+                    </h2>
 
                     <p>
-                      Wybierz, co ma się wydarzyć po uruchomieniu
+                      Wybierz, co ma się
+                      wydarzyć po uruchomieniu
                       gry.
                     </p>
                   </div>
@@ -475,12 +706,15 @@ function App(): React.JSX.Element {
                     type="checkbox"
                     checked={minimizeOnLaunch}
                     onChange={(event) =>
-                      setMinimizeOnLaunch(event.target.checked)
+                      setMinimizeOnLaunch(
+                        event.target.checked
+                      )
                     }
                   />
 
                   <span>
-                    Minimalizuj launcher po uruchomieniu gry
+                    Minimalizuj launcher po
+                    uruchomieniu gry
                   </span>
                 </label>
 
@@ -489,12 +723,15 @@ function App(): React.JSX.Element {
                     type="checkbox"
                     checked={closeOnLaunch}
                     onChange={(event) =>
-                      setCloseOnLaunch(event.target.checked)
+                      setCloseOnLaunch(
+                        event.target.checked
+                      )
                     }
                   />
 
                   <span>
-                    Zamknij launcher po uruchomieniu gry
+                    Zamknij launcher po
+                    uruchomieniu gry
                   </span>
                 </label>
               </article>
