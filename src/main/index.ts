@@ -4,13 +4,25 @@ import {
   dialog,
   ipcMain,
   net,
+  safeStorage,
   shell,
   type OpenDialogOptions,
   type WebContents
 } from 'electron'
-import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { createReadStream, existsSync } from 'node:fs'
+import {
+  execFile,
+  spawn,
+  type ChildProcessWithoutNullStreams
+} from 'node:child_process'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  type WriteStream
+} from 'node:fs'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { release as getOsRelease } from 'node:os'
 import {
   mkdir,
@@ -21,7 +33,14 @@ import {
   stat,
   writeFile
 } from 'node:fs/promises'
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import {
+  delimiter,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve
+} from 'node:path'
 import { promisify } from 'node:util'
 import { inflateRawSync } from 'node:zlib'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
@@ -32,14 +51,17 @@ const execFileAsync = promisify(execFile)
 const VERSION_MANIFEST_URL =
   'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
 
-const SUPPORTED_VERSIONS = new Set([
-  '1.21.11',
-  '1.21.4',
-  '1.20.1'
-])
+const SUPPORTED_VERSIONS = new Set(['1.21.11', '1.21.4', '1.20.1'])
 
 const CACHE_TIME = 5 * 60 * 1000
 const DOWNLOAD_TIMEOUT = 10 * 60 * 1000
+
+const MICROSOFT_CLIENT_ID = '74bdd9fd-713d-4c77-9a80-971ebc6475c7'
+const MICROSOFT_AUTHORITY =
+  'https://login.microsoftonline.com/consumers/oauth2/v2.0'
+const MICROSOFT_SCOPES = 'XboxLive.signin XboxLive.offline_access'
+const MICROSOFT_LOGIN_TIMEOUT = 5 * 60 * 1000
+const MINECRAFT_SERVICES_URL = 'https://api.minecraftservices.com'
 
 interface JavaInfo {
   installed: boolean
@@ -124,6 +146,20 @@ interface MinecraftAssetIndexFile {
   map_to_resources?: boolean
 }
 
+type MinecraftArgument =
+  | string
+  | {
+      rules?: MinecraftLibraryRule[]
+      value: string | string[]
+    }
+
+interface MinecraftLoggingFile {
+  id: string
+  sha1: string
+  size: number
+  url: string
+}
+
 interface MinecraftVersionMetadata {
   id: string
   type: string
@@ -131,6 +167,7 @@ interface MinecraftVersionMetadata {
   releaseTime: string
   mainClass: string
   minimumLauncherVersion?: number
+  minecraftArguments?: string
 
   javaVersion?: {
     component?: string
@@ -146,8 +183,16 @@ interface MinecraftVersionMetadata {
   libraries?: MinecraftLibrary[]
 
   arguments?: {
-    game?: unknown[]
-    jvm?: unknown[]
+    game?: MinecraftArgument[]
+    jvm?: MinecraftArgument[]
+  }
+
+  logging?: {
+    client?: {
+      argument?: string
+      file?: MinecraftLoggingFile
+      type?: string
+    }
   }
 }
 
@@ -191,12 +236,7 @@ interface MinecraftVersionDetails {
 }
 
 type InstallPhase =
-  | 'checking'
-  | 'downloading'
-  | 'verifying'
-  | 'extracting'
-  | 'complete'
-  | 'error'
+  'checking' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error'
 
 interface MinecraftInstallProgress {
   versionId: string
@@ -256,6 +296,140 @@ interface MinecraftInstallResult {
   error: string | null
 }
 
+type MinecraftRunMode = 'microsoft'
+type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
+
+interface MicrosoftAccountState {
+  signedIn: boolean
+  hasMinecraft: boolean
+  username: string | null
+  id: string | null
+  xuid: string | null
+  error: string | null
+}
+
+interface MicrosoftLoginResult extends MicrosoftAccountState {
+  success: boolean
+}
+
+interface MinecraftLaunchRequest {
+  versionId: string
+  gameDirectory: string
+  ram: number
+  profileName: string
+  minimizeOnLaunch: boolean
+  closeOnLaunch: boolean
+}
+
+interface MinecraftLaunchResult {
+  success: boolean
+  running: boolean
+  pid: number | null
+  mode: MinecraftRunMode | null
+  error: string | null
+}
+
+interface MinecraftGameState {
+  phase: MinecraftGamePhase
+  running: boolean
+  pid: number | null
+  startedAt: string | null
+  exitCode: number | null
+  signal: string | null
+  message: string
+}
+
+interface MinecraftGameLog {
+  stream: 'system' | 'stdout' | 'stderr'
+  message: string
+  timestamp: string
+}
+
+interface ActiveMinecraftGame {
+  child: ChildProcessWithoutNullStreams
+  owner: WebContents
+  launcherWindow: BrowserWindow | null
+  startedAt: string
+  logStream: WriteStream
+  hiddenByLauncher: boolean
+}
+
+interface MicrosoftOAuthTokenResponse {
+  token_type: string
+  scope: string
+  expires_in: number
+  access_token: string
+  refresh_token?: string
+}
+
+interface XboxTokenResponse {
+  Token: string
+  DisplayClaims?: {
+    xui?: Array<{
+      uhs?: string
+      xid?: string
+    }>
+  }
+}
+
+interface MinecraftAccessTokenResponse {
+  access_token: string
+  expires_in: number
+  token_type: string
+}
+
+interface MinecraftEntitlementsResponse {
+  items?: Array<{
+    name?: string
+    signature?: string
+  }>
+}
+
+interface MinecraftProfileResponse {
+  id: string
+  name: string
+  skins?: unknown[]
+  capes?: unknown[]
+}
+
+interface MicrosoftMinecraftSession {
+  refreshToken: string
+  minecraftAccessToken: string
+  minecraftExpiresAt: number
+  username: string
+  id: string
+  xuid: string
+}
+
+interface PersistedMicrosoftAccount {
+  version: 1
+  encryptedRefreshToken: string
+  username: string
+  id: string
+  xuid: string
+}
+
+interface AuthErrorBody {
+  error?: string
+  error_description?: string
+  message?: string
+  Message?: string
+  XErr?: number
+  Redirect?: string
+}
+
+class AuthHttpError extends Error {
+  readonly status: number
+  readonly body: AuthErrorBody
+
+  constructor(status: number, message: string, body: AuthErrorBody) {
+    super(message)
+    this.name = 'AuthHttpError'
+    this.status = status
+    this.body = body
+  }
+}
+
 interface FileInspection {
   exists: boolean
   valid: boolean
@@ -265,11 +439,7 @@ interface FileInspection {
 }
 
 type DownloadFileKind =
-  | 'client'
-  | 'library'
-  | 'asset-index'
-  | 'asset'
-  | 'native'
+  'client' | 'library' | 'asset-index' | 'asset' | 'native' | 'logging'
 
 interface DownloadFile {
   kind: DownloadFileKind
@@ -292,6 +462,7 @@ interface VersionPaths {
   assetsDirectory: string
   assetIndexesDirectory: string
   assetObjectsDirectory: string
+  logConfigsDirectory: string
   nativesDirectory: string
   nativeMarkerPath: string
   jarPath: string
@@ -304,6 +475,7 @@ interface MinecraftInstallPlan {
   clientFile: DownloadFile
   libraryFiles: DownloadFile[]
   assetIndexFile: DownloadFile
+  loggingFile: DownloadFile | null
   assetFiles: DownloadFile[]
   nativeArchives: NativeArchive[]
   allFiles: DownloadFile[]
@@ -338,12 +510,22 @@ const versionDetailsCache = new Map<
   CacheEntry<MinecraftVersionDetails>
 >()
 
-const assetIndexCache = new Map<
-  string,
-  CacheEntry<MinecraftAssetIndexFile>
->()
+const assetIndexCache = new Map<string, CacheEntry<MinecraftAssetIndexFile>>()
 
 const activeInstallations = new Set<string>()
+
+let activeMinecraftGame: ActiveMinecraftGame | null = null
+let activeMicrosoftSession: MicrosoftMinecraftSession | null = null
+let microsoftLoginInProgress = false
+let lastMinecraftGameState: MinecraftGameState = {
+  phase: 'idle',
+  running: false,
+  pid: null,
+  startedAt: null,
+  exitCode: null,
+  signal: null,
+  message: 'Gra nie jest uruchomiona.'
+}
 
 function isCacheFresh(loadedAt: number): boolean {
   return Date.now() - loadedAt < CACHE_TIME
@@ -394,8 +576,7 @@ function detectJavaVendor(output: string): string {
 
 async function findJavaPath(): Promise<string | null> {
   try {
-    const locatorCommand =
-      process.platform === 'win32' ? 'where.exe' : 'which'
+    const locatorCommand = process.platform === 'win32' ? 'where.exe' : 'which'
 
     const { stdout } = await execFileAsync(locatorCommand, ['java'], {
       windowsHide: true
@@ -471,10 +652,7 @@ function getTrustedMinecraftUrl(value: string): string {
   return parsedUrl.toString()
 }
 
-async function fetchJson<T>(
-  url: string,
-  errorName: string
-): Promise<T> {
+async function fetchJson<T>(url: string, errorName: string): Promise<T> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 15000)
 
@@ -488,9 +666,7 @@ async function fetchJson<T>(
     })
 
     if (!response.ok) {
-      throw new Error(
-        `${errorName}: serwer zwrócił HTTP ${response.status}.`
-      )
+      throw new Error(`${errorName}: serwer zwrócił HTTP ${response.status}.`)
     }
 
     return (await response.json()) as T
@@ -499,10 +675,7 @@ async function fetchJson<T>(
   }
 }
 
-async function fetchBuffer(
-  url: string,
-  errorName: string
-): Promise<Buffer> {
+async function fetchBuffer(url: string, errorName: string): Promise<Buffer> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 30000)
 
@@ -513,9 +686,7 @@ async function fetchBuffer(
     })
 
     if (!response.ok) {
-      throw new Error(
-        `${errorName}: serwer zwrócił HTTP ${response.status}.`
-      )
+      throw new Error(`${errorName}: serwer zwrócił HTTP ${response.status}.`)
     }
 
     return Buffer.from(await response.arrayBuffer())
@@ -544,11 +715,7 @@ async function getMinecraftAssetIndex(
   const cacheKey = `${assetIndex.id}:${assetIndex.sha1}`
   const cachedIndex = assetIndexCache.get(cacheKey)
 
-  if (
-    !forceRefresh &&
-    cachedIndex &&
-    isCacheFresh(cachedIndex.loadedAt)
-  ) {
+  if (!forceRefresh && cachedIndex && isCacheFresh(cachedIndex.loadedAt)) {
     return cachedIndex.data
   }
 
@@ -597,11 +764,7 @@ async function getMinecraftAssetIndex(
 async function getMinecraftManifest(
   forceRefresh = false
 ): Promise<MinecraftVersionManifest> {
-  if (
-    !forceRefresh &&
-    manifestCache &&
-    isCacheFresh(manifestCache.loadedAt)
-  ) {
+  if (!forceRefresh && manifestCache && isCacheFresh(manifestCache.loadedAt)) {
     return manifestCache.data
   }
 
@@ -627,9 +790,7 @@ async function getMinecraftVersionMetadata(
   forceRefresh = false
 ): Promise<MinecraftVersionMetadata> {
   if (!SUPPORTED_VERSIONS.has(versionId)) {
-    throw new Error(
-      'Ta wersja nie jest obsługiwana przez Aurora Launcher.'
-    )
+    throw new Error('Ta wersja nie jest obsługiwana przez Aurora Launcher.')
   }
 
   const cachedMetadata = versionMetadataCache.get(versionId)
@@ -648,9 +809,7 @@ async function getMinecraftVersionMetadata(
   )
 
   if (!manifestVersion) {
-    throw new Error(
-      `Minecraft ${versionId} nie występuje w manifeście Mojang.`
-    )
+    throw new Error(`Minecraft ${versionId} nie występuje w manifeście Mojang.`)
   }
 
   const metadata = await fetchJson<MinecraftVersionMetadata>(
@@ -659,9 +818,7 @@ async function getMinecraftVersionMetadata(
   )
 
   if (!metadata || metadata.id !== versionId) {
-    throw new Error(
-      'Plik szczegółów wersji ma nieprawidłowy format.'
-    )
+    throw new Error('Plik szczegółów wersji ma nieprawidłowy format.')
   }
 
   versionMetadataCache.set(versionId, {
@@ -727,6 +884,683 @@ function getErrorMessage(error: unknown): string {
   return 'Nie udało się połączyć z serwerem Mojang.'
 }
 
+function getMicrosoftAccountPath(): string {
+  return join(app.getPath('userData'), 'microsoft-account.json')
+}
+
+function toBase64Url(value: Buffer): string {
+  return value
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+}
+
+function valuesMatch(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left)
+  const rightBuffer = Buffer.from(right)
+
+  return (
+    leftBuffer.length === rightBuffer.length &&
+    timingSafeEqual(leftBuffer, rightBuffer)
+  )
+}
+
+function getTrustedAuthUrl(value: string): string {
+  const parsedUrl = new URL(value)
+  const allowedHosts = new Set([
+    'login.microsoftonline.com',
+    'user.auth.xboxlive.com',
+    'xsts.auth.xboxlive.com',
+    'api.minecraftservices.com'
+  ])
+
+  if (
+    parsedUrl.protocol !== 'https:' ||
+    !allowedHosts.has(parsedUrl.hostname.toLowerCase())
+  ) {
+    throw new Error('Adres usługi logowania nie jest zaufany.')
+  }
+
+  return parsedUrl.toString()
+}
+
+async function fetchAuthJson<T>(
+  url: string,
+  options: RequestInit,
+  errorName: string
+): Promise<T> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 30000)
+
+  try {
+    const response = await net.fetch(getTrustedAuthUrl(url), {
+      ...options,
+      signal: controller.signal
+    })
+    const text = await response.text()
+    let body: unknown = {}
+
+    if (text) {
+      try {
+        body = JSON.parse(text)
+      } catch {
+        body = { message: text.slice(0, 500) }
+      }
+    }
+
+    if (!response.ok) {
+      const errorBody = body as AuthErrorBody
+      const serviceMessage =
+        errorBody.error_description ??
+        errorBody.message ??
+        errorBody.Message ??
+        errorBody.error ??
+        `HTTP ${response.status}`
+
+      throw new AuthHttpError(
+        response.status,
+        `${errorName}: ${serviceMessage}`,
+        errorBody
+      )
+    }
+
+    return body as T
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function writeOAuthBrowserResponse(
+  response: import('node:http').ServerResponse,
+  success: boolean,
+  message: string
+): void {
+  const title = success ? 'Logowanie zakończone' : 'Logowanie nieudane'
+  const accent = success ? '#a855f7' : '#ff6b91'
+  const safeMessage = message
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+
+  response.writeHead(success ? 200 : 400, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store'
+  })
+  response.end(`<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title}</title>
+</head>
+<body style="margin:0;display:grid;min-height:100vh;place-items:center;background:#08060b;color:#eee7f2;font-family:Segoe UI,Arial,sans-serif">
+  <main style="max-width:520px;padding:32px;text-align:center;background:#130d19;border:1px solid ${accent};border-radius:18px;box-shadow:0 24px 80px rgba(0,0,0,.55)">
+    <h1 style="margin:0 0 12px;color:${accent};font-size:26px">${title}</h1>
+    <p style="margin:0;color:#b7aabd;line-height:1.6">${safeMessage}</p>
+    <p style="margin:18px 0 0;color:#776d7d;font-size:13px">Możesz zamknąć tę kartę i wrócić do Aurora Launcher.</p>
+  </main>
+</body>
+</html>`)
+}
+
+async function requestMicrosoftAuthorizationCode(): Promise<{
+  code: string
+  codeVerifier: string
+  redirectUri: string
+}> {
+  const codeVerifier = toBase64Url(randomBytes(64))
+  const codeChallenge = toBase64Url(
+    createHash('sha256').update(codeVerifier).digest()
+  )
+  const expectedState = toBase64Url(randomBytes(32))
+
+  let resolveCallback:
+    | ((value: {
+        code: string
+        codeVerifier: string
+        redirectUri: string
+      }) => void)
+    | null = null
+  let rejectCallback: ((reason: Error) => void) | null = null
+
+  const callbackPromise = new Promise<{
+    code: string
+    codeVerifier: string
+    redirectUri: string
+  }>((resolvePromise, rejectPromise) => {
+    resolveCallback = resolvePromise
+    rejectCallback = rejectPromise
+  })
+
+  const server = createServer((request, response) => {
+    try {
+      if (!request.url) {
+        throw new Error('Brak adresu odpowiedzi logowania.')
+      }
+
+      const address = server.address()
+
+      if (!address || typeof address === 'string') {
+        throw new Error('Nie udało się odczytać portu logowania.')
+      }
+
+      const redirectUri = `http://localhost:${address.port}/`
+      const callbackUrl = new URL(request.url, redirectUri)
+      const returnedState = callbackUrl.searchParams.get('state') ?? ''
+      const authorizationCode = callbackUrl.searchParams.get('code')
+      const oauthError = callbackUrl.searchParams.get('error')
+      const oauthErrorDescription =
+        callbackUrl.searchParams.get('error_description')
+
+      if (!valuesMatch(returnedState, expectedState)) {
+        throw new Error('Odpowiedź logowania ma nieprawidłowy parametr state.')
+      }
+
+      if (oauthError) {
+        throw new Error(
+          oauthErrorDescription
+            ? `Microsoft odrzucił logowanie: ${oauthErrorDescription}`
+            : `Microsoft odrzucił logowanie: ${oauthError}`
+        )
+      }
+
+      if (!authorizationCode) {
+        throw new Error('Microsoft nie zwrócił kodu autoryzacyjnego.')
+      }
+
+      writeOAuthBrowserResponse(
+        response,
+        true,
+        'Konto Microsoft zostało przekazane do launchera.'
+      )
+      resolveCallback?.({
+        code: authorizationCode,
+        codeVerifier,
+        redirectUri
+      })
+      resolveCallback = null
+      rejectCallback = null
+    } catch (error) {
+      const message = getErrorMessage(error)
+      writeOAuthBrowserResponse(response, false, message)
+      rejectCallback?.(new Error(message))
+      resolveCallback = null
+      rejectCallback = null
+    }
+  })
+
+  await new Promise<void>((resolveListen, rejectListen) => {
+    server.once('error', rejectListen)
+    server.listen(0, 'localhost', () => {
+      server.off('error', rejectListen)
+      resolveListen()
+    })
+  })
+
+  const address = server.address() as AddressInfo
+  const redirectUri = `http://localhost:${address.port}/`
+  const authorizationUrl = new URL(`${MICROSOFT_AUTHORITY}/authorize`)
+
+  authorizationUrl.searchParams.set('client_id', MICROSOFT_CLIENT_ID)
+  authorizationUrl.searchParams.set('response_type', 'code')
+  authorizationUrl.searchParams.set('redirect_uri', redirectUri)
+  authorizationUrl.searchParams.set('response_mode', 'query')
+  authorizationUrl.searchParams.set('scope', MICROSOFT_SCOPES)
+  authorizationUrl.searchParams.set('state', expectedState)
+  authorizationUrl.searchParams.set('code_challenge', codeChallenge)
+  authorizationUrl.searchParams.set('code_challenge_method', 'S256')
+  authorizationUrl.searchParams.set('prompt', 'select_account')
+
+  let loginTimeout: NodeJS.Timeout | null = null
+  const timeoutPromise = new Promise<never>((_, rejectTimeout) => {
+    loginTimeout = setTimeout(() => {
+      rejectTimeout(
+        new Error('Przekroczono czas oczekiwania na logowanie Microsoft.')
+      )
+    }, MICROSOFT_LOGIN_TIMEOUT)
+  })
+
+  try {
+    await shell.openExternal(authorizationUrl.toString())
+    return await Promise.race([callbackPromise, timeoutPromise])
+  } finally {
+    if (loginTimeout) {
+      clearTimeout(loginTimeout)
+    }
+
+    await new Promise<void>((resolveClose) => {
+      server.close(() => resolveClose())
+    })
+  }
+}
+
+async function exchangeAuthorizationCode(
+  code: string,
+  codeVerifier: string,
+  redirectUri: string
+): Promise<MicrosoftOAuthTokenResponse> {
+  const form = new URLSearchParams({
+    client_id: MICROSOFT_CLIENT_ID,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    code_verifier: codeVerifier,
+    scope: MICROSOFT_SCOPES
+  })
+
+  return fetchAuthJson<MicrosoftOAuthTokenResponse>(
+    `${MICROSOFT_AUTHORITY}/token`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json'
+      },
+      body: form.toString()
+    },
+    'Nie udało się odebrać tokenu Microsoft'
+  )
+}
+
+async function refreshMicrosoftAccessToken(
+  refreshToken: string
+): Promise<MicrosoftOAuthTokenResponse> {
+  const form = new URLSearchParams({
+    client_id: MICROSOFT_CLIENT_ID,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+    scope: MICROSOFT_SCOPES
+  })
+
+  return fetchAuthJson<MicrosoftOAuthTokenResponse>(
+    `${MICROSOFT_AUTHORITY}/token`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json'
+      },
+      body: form.toString()
+    },
+    'Nie udało się odświeżyć logowania Microsoft'
+  )
+}
+
+function getXboxAuthError(error: AuthHttpError): string {
+  const xerr = error.body.XErr
+
+  if (xerr === 2148916233) {
+    return 'To konto Microsoft nie ma utworzonego profilu Xbox. Zaloguj się wcześniej do aplikacji Xbox lub strony Xbox i utwórz gamertag.'
+  }
+
+  if (xerr === 2148916235) {
+    return 'Usługi Xbox Live nie są dostępne dla regionu ustawionego na tym koncie.'
+  }
+
+  if (xerr === 2148916236) {
+    return 'Konto Xbox wymaga dodatkowej weryfikacji wieku.'
+  }
+
+  if (xerr === 2148916237 || xerr === 2148916238) {
+    return 'To konto jest kontem dziecka i wymaga zgody lub dodania do grupy rodzinnej Microsoft.'
+  }
+
+  return error.message
+}
+
+async function authenticateXboxUser(
+  microsoftAccessToken: string
+): Promise<XboxTokenResponse> {
+  return fetchAuthJson<XboxTokenResponse>(
+    'https://user.auth.xboxlive.com/user/authenticate',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'x-xbl-contract-version': '1'
+      },
+      body: JSON.stringify({
+        RelyingParty: 'http://auth.xboxlive.com',
+        TokenType: 'JWT',
+        Properties: {
+          AuthMethod: 'RPS',
+          SiteName: 'user.auth.xboxlive.com',
+          RpsTicket: `d=${microsoftAccessToken}`
+        }
+      })
+    },
+    'Nie udało się zalogować do Xbox Live'
+  )
+}
+
+async function authorizeMinecraftXsts(
+  xboxUserToken: string
+): Promise<XboxTokenResponse> {
+  try {
+    return await fetchAuthJson<XboxTokenResponse>(
+      'https://xsts.auth.xboxlive.com/xsts/authorize',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'x-xbl-contract-version': '1'
+        },
+        body: JSON.stringify({
+          Properties: {
+            SandboxId: 'RETAIL',
+            UserTokens: [xboxUserToken]
+          },
+          RelyingParty: 'rp://api.minecraftservices.com/',
+          TokenType: 'JWT'
+        })
+      },
+      'Nie udało się uzyskać tokenu Xbox dla Minecrafta'
+    )
+  } catch (error) {
+    if (error instanceof AuthHttpError) {
+      throw new Error(getXboxAuthError(error))
+    }
+
+    throw error
+  }
+}
+
+async function loginMinecraftServices(
+  userHash: string,
+  xstsToken: string
+): Promise<MinecraftAccessTokenResponse> {
+  try {
+    return await fetchAuthJson<MinecraftAccessTokenResponse>(
+      `${MINECRAFT_SERVICES_URL}/authentication/login_with_xbox`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json'
+        },
+        body: JSON.stringify({
+          identityToken: `XBL3.0 x=${userHash};${xstsToken}`
+        })
+      },
+      'Minecraft Services odrzucił logowanie'
+    )
+  } catch (error) {
+    if (
+      error instanceof AuthHttpError &&
+      error.status === 403 &&
+      /invalid app registration/i.test(error.message)
+    ) {
+      throw new Error(
+        'Minecraft Services odrzucił Client ID aplikacji jako „Invalid app registration”. Rejestracja Entra działa, ale ten identyfikator nie został jeszcze dopuszczony do logowania Minecraft. W takim przypadku trzeba uzyskać akceptację aplikacji w ekosystemie Xbox/Minecraft.'
+      )
+    }
+
+    throw error
+  }
+}
+
+async function getMinecraftEntitlements(
+  accessToken: string
+): Promise<MinecraftEntitlementsResponse> {
+  return fetchAuthJson<MinecraftEntitlementsResponse>(
+    `${MINECRAFT_SERVICES_URL}/entitlements/mcstore`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json'
+      }
+    },
+    'Nie udało się sprawdzić posiadania Minecrafta'
+  )
+}
+
+async function getMinecraftProfile(
+  accessToken: string
+): Promise<MinecraftProfileResponse> {
+  try {
+    return await fetchAuthJson<MinecraftProfileResponse>(
+      `${MINECRAFT_SERVICES_URL}/minecraft/profile`,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json'
+        }
+      },
+      'Nie udało się pobrać profilu Minecraft Java'
+    )
+  } catch (error) {
+    if (error instanceof AuthHttpError && error.status === 404) {
+      throw new Error(
+        'To konto nie ma profilu Minecraft Java. Sprawdź, czy gra została kupiona i czy profil gracza został utworzony w oficjalnym launcherze.'
+      )
+    }
+
+    throw error
+  }
+}
+
+async function completeMinecraftAuthentication(
+  oauthTokens: MicrosoftOAuthTokenResponse,
+  fallbackRefreshToken?: string
+): Promise<MicrosoftMinecraftSession> {
+  const refreshToken = oauthTokens.refresh_token ?? fallbackRefreshToken
+
+  if (!refreshToken) {
+    throw new Error(
+      'Microsoft nie zwrócił tokenu odświeżania. Sprawdź konfigurację publicznego klienta i zakres XboxLive.offline_access.'
+    )
+  }
+
+  const xboxUser = await authenticateXboxUser(oauthTokens.access_token)
+  const xboxUserToken = xboxUser.Token
+
+  if (!xboxUserToken) {
+    throw new Error('Xbox Live nie zwrócił tokenu użytkownika.')
+  }
+
+  const xsts = await authorizeMinecraftXsts(xboxUserToken)
+  const xui = xsts.DisplayClaims?.xui?.[0]
+  const userHash = xui?.uhs
+
+  if (!xsts.Token || !userHash) {
+    throw new Error('Xbox Live nie zwrócił danych wymaganych przez Minecraft.')
+  }
+
+  const minecraftToken = await loginMinecraftServices(userHash, xsts.Token)
+  const entitlements = await getMinecraftEntitlements(
+    minecraftToken.access_token
+  )
+
+  if (!Array.isArray(entitlements.items) || entitlements.items.length === 0) {
+    throw new Error(
+      'To konto Microsoft nie posiada licencji Minecraft Java Edition.'
+    )
+  }
+
+  const profile = await getMinecraftProfile(minecraftToken.access_token)
+
+  if (!profile.id || !profile.name) {
+    throw new Error('Profil Minecraft Java ma nieprawidłowy format.')
+  }
+
+  return {
+    refreshToken,
+    minecraftAccessToken: minecraftToken.access_token,
+    minecraftExpiresAt:
+      Date.now() + Math.max(60, minecraftToken.expires_in - 60) * 1000,
+    username: profile.name,
+    id: profile.id,
+    xuid: xui?.xid ?? '0'
+  }
+}
+
+async function saveMicrosoftSession(
+  session: MicrosoftMinecraftSession
+): Promise<void> {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error(
+      'System nie udostępnia bezpiecznego magazynu poświadczeń. Aurora nie zapisze tokenu bez szyfrowania.'
+    )
+  }
+
+  const encryptedRefreshToken = safeStorage
+    .encryptString(session.refreshToken)
+    .toString('base64')
+  const persisted: PersistedMicrosoftAccount = {
+    version: 1,
+    encryptedRefreshToken,
+    username: session.username,
+    id: session.id,
+    xuid: session.xuid
+  }
+
+  await mkdir(dirname(getMicrosoftAccountPath()), { recursive: true })
+  await writeFile(
+    getMicrosoftAccountPath(),
+    JSON.stringify(persisted, null, 2),
+    'utf8'
+  )
+}
+
+async function loadPersistedRefreshToken(): Promise<string | null> {
+  try {
+    const text = await readFile(getMicrosoftAccountPath(), 'utf8')
+    const persisted = JSON.parse(text) as Partial<PersistedMicrosoftAccount>
+
+    if (
+      persisted.version !== 1 ||
+      typeof persisted.encryptedRefreshToken !== 'string' ||
+      !persisted.encryptedRefreshToken
+    ) {
+      throw new Error('Plik konta Microsoft ma nieprawidłowy format.')
+    }
+
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error('Bezpieczny magazyn systemu jest niedostępny.')
+    }
+
+    return safeStorage.decryptString(
+      Buffer.from(persisted.encryptedRefreshToken, 'base64')
+    )
+  } catch (error) {
+    if (isFileNotFound(error)) {
+      return null
+    }
+
+    throw error
+  }
+}
+
+function toMicrosoftAccountState(
+  session: MicrosoftMinecraftSession | null,
+  error: string | null = null
+): MicrosoftAccountState {
+  return {
+    signedIn: session !== null,
+    hasMinecraft: session !== null,
+    username: session?.username ?? null,
+    id: session?.id ?? null,
+    xuid: session?.xuid ?? null,
+    error
+  }
+}
+
+async function ensureMicrosoftSession(): Promise<MicrosoftMinecraftSession> {
+  if (
+    activeMicrosoftSession &&
+    activeMicrosoftSession.minecraftExpiresAt > Date.now() + 2 * 60 * 1000
+  ) {
+    return activeMicrosoftSession
+  }
+
+  const refreshToken =
+    activeMicrosoftSession?.refreshToken ?? (await loadPersistedRefreshToken())
+
+  if (!refreshToken) {
+    throw new Error(
+      'Najpierw zaloguj się kontem Microsoft posiadającym Minecraft Java.'
+    )
+  }
+
+  const oauthTokens = await refreshMicrosoftAccessToken(refreshToken)
+  const session = await completeMinecraftAuthentication(
+    oauthTokens,
+    refreshToken
+  )
+
+  await saveMicrosoftSession(session)
+  activeMicrosoftSession = session
+
+  return session
+}
+
+async function getMicrosoftAccountState(): Promise<MicrosoftAccountState> {
+  try {
+    const session = await ensureMicrosoftSession()
+    return toMicrosoftAccountState(session)
+  } catch (error) {
+    const message = getErrorMessage(error)
+
+    if (/najpierw zaloguj/i.test(message)) {
+      return toMicrosoftAccountState(null)
+    }
+
+    return toMicrosoftAccountState(null, message)
+  }
+}
+
+async function loginMicrosoftAccount(): Promise<MicrosoftLoginResult> {
+  if (microsoftLoginInProgress) {
+    return {
+      success: false,
+      ...toMicrosoftAccountState(
+        activeMicrosoftSession,
+        'Logowanie Microsoft jest już w toku.'
+      )
+    }
+  }
+
+  microsoftLoginInProgress = true
+
+  try {
+    const authorization = await requestMicrosoftAuthorizationCode()
+    const oauthTokens = await exchangeAuthorizationCode(
+      authorization.code,
+      authorization.codeVerifier,
+      authorization.redirectUri
+    )
+    const session = await completeMinecraftAuthentication(oauthTokens)
+
+    await saveMicrosoftSession(session)
+    activeMicrosoftSession = session
+
+    return {
+      success: true,
+      ...toMicrosoftAccountState(session)
+    }
+  } catch (error) {
+    return {
+      success: false,
+      ...toMicrosoftAccountState(null, getErrorMessage(error))
+    }
+  } finally {
+    microsoftLoginInProgress = false
+  }
+}
+
+async function logoutMicrosoftAccount(): Promise<boolean> {
+  activeMicrosoftSession = null
+  await rm(getMicrosoftAccountPath(), { force: true })
+  return true
+}
+
 async function checkMinecraftVersion(
   versionId: string,
   forceRefresh = false
@@ -740,9 +1574,7 @@ async function checkMinecraftVersion(
 
   try {
     const manifest = await getMinecraftManifest(forceRefresh)
-    const version = manifest.versions.find(
-      (entry) => entry.id === versionId
-    )
+    const version = manifest.versions.find((entry) => entry.id === versionId)
 
     if (!version) {
       return getUnavailableVersionInfo(
@@ -761,10 +1593,7 @@ async function checkMinecraftVersion(
       error: null
     }
   } catch (error) {
-    return getUnavailableVersionInfo(
-      versionId,
-      getErrorMessage(error)
-    )
+    return getUnavailableVersionInfo(versionId, getErrorMessage(error))
   }
 }
 
@@ -781,31 +1610,22 @@ async function getMinecraftVersionDetails(
 
   const cachedDetails = versionDetailsCache.get(versionId)
 
-  if (
-    !forceRefresh &&
-    cachedDetails &&
-    isCacheFresh(cachedDetails.loadedAt)
-  ) {
+  if (!forceRefresh && cachedDetails && isCacheFresh(cachedDetails.loadedAt)) {
     return cachedDetails.data
   }
 
   try {
-    const metadata = await getMinecraftVersionMetadata(
-      versionId,
-      forceRefresh
-    )
+    const metadata = await getMinecraftVersionMetadata(versionId, forceRefresh)
 
     const details: MinecraftVersionDetails = {
       available: true,
       id: metadata.id,
       type: metadata.type ?? null,
       releaseTime: metadata.releaseTime ?? null,
-      javaMajorVersion:
-        metadata.javaVersion?.majorVersion ?? null,
+      javaMajorVersion: metadata.javaVersion?.majorVersion ?? null,
       javaComponent: metadata.javaVersion?.component ?? null,
       mainClass: metadata.mainClass ?? null,
-      minimumLauncherVersion:
-        metadata.minimumLauncherVersion ?? null,
+      minimumLauncherVersion: metadata.minimumLauncherVersion ?? null,
       clientUrl: metadata.downloads?.client?.url ?? null,
       clientSha1: metadata.downloads?.client?.sha1 ?? null,
       clientSize: metadata.downloads?.client?.size ?? null,
@@ -827,13 +1647,9 @@ async function getMinecraftVersionDetails(
 
     return details
   } catch (error) {
-    return getUnavailableVersionDetails(
-      versionId,
-      getErrorMessage(error)
-    )
+    return getUnavailableVersionDetails(versionId, getErrorMessage(error))
   }
 }
-
 
 function getMinecraftOsName(): 'windows' | 'osx' | 'linux' {
   if (process.platform === 'win32') {
@@ -871,7 +1687,10 @@ function getNativeClassifierArchitecture(): string {
   return process.arch
 }
 
-function matchesRule(rule: MinecraftLibraryRule): boolean {
+function matchesRule(
+  rule: MinecraftLibraryRule,
+  features: Record<string, boolean> = {}
+): boolean {
   if (rule.os?.name && rule.os.name !== getMinecraftOsName()) {
     return false
   }
@@ -891,8 +1710,10 @@ function matchesRule(rule: MinecraftLibraryRule): boolean {
   }
 
   if (rule.features) {
-    for (const expectedValue of Object.values(rule.features)) {
-      if (expectedValue !== false) {
+    for (const [featureName, expectedValue] of Object.entries(rule.features)) {
+      const actualValue = features[featureName] ?? false
+
+      if (actualValue !== expectedValue) {
         return false
       }
     }
@@ -901,15 +1722,18 @@ function matchesRule(rule: MinecraftLibraryRule): boolean {
   return true
 }
 
-function isLibraryAllowed(library: MinecraftLibrary): boolean {
-  if (!library.rules || library.rules.length === 0) {
+function areRulesAllowed(
+  rules: MinecraftLibraryRule[] | undefined,
+  features: Record<string, boolean> = {}
+): boolean {
+  if (!rules || rules.length === 0) {
     return true
   }
 
   let allowed = false
 
-  for (const rule of library.rules) {
-    if (matchesRule(rule)) {
+  for (const rule of rules) {
+    if (matchesRule(rule, features)) {
       allowed = rule.action === 'allow'
     }
   }
@@ -917,19 +1741,18 @@ function isLibraryAllowed(library: MinecraftLibrary): boolean {
   return allowed
 }
 
-function getNativeClassifier(
-  library: MinecraftLibrary
-): string | null {
+function isLibraryAllowed(library: MinecraftLibrary): boolean {
+  return areRulesAllowed(library.rules)
+}
+
+function getNativeClassifier(library: MinecraftLibrary): string | null {
   const template = library.natives?.[getMinecraftOsName()]
 
   if (!template) {
     return null
   }
 
-  return template.replace(
-    /\$\{arch\}/g,
-    getNativeClassifierArchitecture()
-  )
+  return template.replace(/\$\{arch\}/g, getNativeClassifierArchitecture())
 }
 
 function validateDownloadProperties(
@@ -1002,22 +1825,13 @@ function getVersionPaths(
   versionId: string
 ): VersionPaths {
   if (!SUPPORTED_VERSIONS.has(versionId)) {
-    throw new Error(
-      'Ta wersja nie jest obsługiwana przez Aurora Launcher.'
-    )
+    throw new Error('Ta wersja nie jest obsługiwana przez Aurora Launcher.')
   }
 
   const safeGameDirectory = validateGameDirectory(gameDirectory)
-  const versionDirectory = join(
-    safeGameDirectory,
-    'versions',
-    versionId
-  )
+  const versionDirectory = join(safeGameDirectory, 'versions', versionId)
   const assetsDirectory = join(safeGameDirectory, 'assets')
-  const nativesDirectory = join(
-    versionDirectory,
-    `${versionId}-natives`
-  )
+  const nativesDirectory = join(versionDirectory, `${versionId}-natives`)
 
   return {
     versionDirectory,
@@ -1025,6 +1839,7 @@ function getVersionPaths(
     assetsDirectory,
     assetIndexesDirectory: join(assetsDirectory, 'indexes'),
     assetObjectsDirectory: join(assetsDirectory, 'objects'),
+    logConfigsDirectory: join(assetsDirectory, 'log_configs'),
     nativesDirectory,
     nativeMarkerPath: join(nativesDirectory, '.aurora-natives.json'),
     jarPath: join(versionDirectory, `${versionId}.jar`),
@@ -1033,9 +1848,7 @@ function getVersionPaths(
 }
 
 function getPathKey(filePath: string): string {
-  return process.platform === 'win32'
-    ? filePath.toLowerCase()
-    : filePath
+  return process.platform === 'win32' ? filePath.toLowerCase() : filePath
 }
 
 function createDownloadFile(
@@ -1044,12 +1857,7 @@ function createDownloadFile(
   artifact: MinecraftLibraryArtifact | MinecraftDownload,
   targetPath: string
 ): DownloadFile {
-  validateDownloadProperties(
-    label,
-    artifact.url,
-    artifact.sha1,
-    artifact.size
-  )
+  validateDownloadProperties(label, artifact.url, artifact.sha1, artifact.size)
 
   return {
     kind,
@@ -1067,10 +1875,7 @@ async function getMinecraftInstallPlan(
   gameDirectory: string,
   forceRefresh = false
 ): Promise<MinecraftInstallPlan> {
-  const metadata = await getMinecraftVersionMetadata(
-    versionId,
-    forceRefresh
-  )
+  const metadata = await getMinecraftVersionMetadata(versionId, forceRefresh)
   const paths = getVersionPaths(gameDirectory, versionId)
   const client = metadata.downloads?.client
 
@@ -1133,8 +1938,7 @@ async function getMinecraftInstallPlan(
     const nativeClassifier = getNativeClassifier(library)
 
     if (nativeClassifier) {
-      const nativeArtifact =
-        library.downloads?.classifiers?.[nativeClassifier]
+      const nativeArtifact = library.downloads?.classifiers?.[nativeClassifier]
 
       if (!nativeArtifact) {
         throw new Error(
@@ -1160,10 +1964,7 @@ async function getMinecraftInstallPlan(
       if (addUniqueFile(nativeFiles, nativeFile)) {
         nativeArchives.push({
           file: nativeFile,
-          excludes: [
-            'META-INF/',
-            ...(library.extract?.exclude ?? [])
-          ]
+          excludes: ['META-INF/', ...(library.extract?.exclude ?? [])]
         })
       }
 
@@ -1187,22 +1988,34 @@ async function getMinecraftInstallPlan(
     throw new Error('Indeks assetów ma nieprawidłowy identyfikator.')
   }
 
-  const assetIndex = await getMinecraftAssetIndex(
-    metadata,
-    forceRefresh
-  )
+  const assetIndex = await getMinecraftAssetIndex(metadata, forceRefresh)
 
   const assetIndexFile = createDownloadFile(
     'asset-index',
     `Indeks assetów ${assetIndexMetadata.id}`,
     assetIndexMetadata,
-    join(
-      paths.assetIndexesDirectory,
-      `${assetIndexMetadata.id}.json`
-    )
+    join(paths.assetIndexesDirectory, `${assetIndexMetadata.id}.json`)
   )
 
   usedPaths.add(getPathKey(assetIndexFile.targetPath))
+
+  const loggingMetadata = metadata.logging?.client?.file
+  let loggingFile: DownloadFile | null = null
+
+  if (loggingMetadata) {
+    if (!/^[A-Za-z0-9._-]+$/.test(loggingMetadata.id)) {
+      throw new Error('Plik konfiguracji logów ma nieprawidłową nazwę.')
+    }
+
+    loggingFile = createDownloadFile(
+      'logging',
+      `Konfiguracja logów ${loggingMetadata.id}`,
+      loggingMetadata,
+      join(paths.logConfigsDirectory, loggingMetadata.id)
+    )
+
+    usedPaths.add(getPathKey(loggingFile.targetPath))
+  }
 
   const assetFiles: DownloadFile[] = []
 
@@ -1249,6 +2062,7 @@ async function getMinecraftInstallPlan(
     clientFile,
     libraryFiles,
     assetIndexFile,
+    loggingFile,
     assetFiles,
     nativeArchives,
     allFiles: [
@@ -1256,6 +2070,7 @@ async function getMinecraftInstallPlan(
       ...libraryFiles,
       ...nativeFiles,
       assetIndexFile,
+      ...(loggingFile ? [loggingFile] : []),
       ...assetFiles
     ]
   }
@@ -1360,10 +2175,7 @@ async function inspectDownloadFiles(
       }
 
       const file = files[index]
-      results[index] = await inspectDownloadFile(
-        file,
-        shouldVerifyHash(file)
-      )
+      results[index] = await inspectDownloadFile(file, shouldVerifyHash(file))
       completed += 1
       onInspected?.(completed, files.length, file)
     }
@@ -1373,9 +2185,7 @@ async function inspectDownloadFiles(
   return results
 }
 
-function countFileStates(
-  inspections: FileInspection[]
-): {
+function countFileStates(inspections: FileInspection[]): {
   valid: number
   missing: number
   invalid: number
@@ -1401,9 +2211,7 @@ function countFileStates(
   }
 }
 
-function getExpectedNativeArchiveSha1s(
-  plan: MinecraftInstallPlan
-): string[] {
+function getExpectedNativeArchiveSha1s(plan: MinecraftInstallPlan): string[] {
   return plan.nativeArchives
     .map((archive) => archive.file.sha1.toLowerCase())
     .sort()
@@ -1505,6 +2313,9 @@ async function getMinecraftInstallStatus(
     const clientInspection = getInspection(plan.clientFile)
     const libraryInspections = plan.libraryFiles.map(getInspection)
     const assetIndexInspection = getInspection(plan.assetIndexFile)
+    const loggingInspection = plan.loggingFile
+      ? getInspection(plan.loggingFile)
+      : null
     const assetInspections = plan.assetFiles.map(getInspection)
     const nativeInspections = plan.nativeArchives.map((archive) =>
       getInspection(archive.file)
@@ -1519,6 +2330,7 @@ async function getMinecraftInstallStatus(
       clientInspection.valid &&
       libraryStates.valid === plan.libraryFiles.length &&
       assetIndexInspection.valid &&
+      (loggingInspection?.valid ?? true) &&
       assetStates.valid === plan.assetFiles.length &&
       nativeStates.valid === plan.nativeArchives.length &&
       nativeExtraction.valid
@@ -1537,6 +2349,10 @@ async function getMinecraftInstallStatus(
       error = assetIndexInspection.exists
         ? 'Indeks assetów jest uszkodzony.'
         : 'Brakuje indeksu assetów.'
+    } else if (loggingInspection && !loggingInspection.valid) {
+      error = loggingInspection.exists
+        ? 'Konfiguracja logów Minecraft jest uszkodzona.'
+        : 'Brakuje konfiguracji logów Minecraft.'
     } else if (assetStates.invalid > 0) {
       error = `Uszkodzone assety: ${assetStates.invalid}.`
     } else if (assetStates.missing > 0) {
@@ -1686,10 +2502,7 @@ async function downloadAndVerifyFile(
   })
 
   const controller = new AbortController()
-  const timeout = setTimeout(
-    () => controller.abort(),
-    DOWNLOAD_TIMEOUT
-  )
+  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT)
 
   try {
     const response = await net.fetch(file.url, {
@@ -1749,10 +2562,7 @@ async function downloadAndVerifyFile(
 
         const now = Date.now()
 
-        if (
-          now - lastProgressUpdate >= 100 ||
-          currentFileBytes >= file.size
-        ) {
+        if (now - lastProgressUpdate >= 100 || currentFileBytes >= file.size) {
           lastProgressUpdate = now
           onProgress(currentFileBytes, 'downloading')
         }
@@ -1865,13 +2675,10 @@ async function downloadFilesConcurrently(
       activeBytes.set(index, 0)
 
       try {
-        await downloadAndVerifyFile(
-          file,
-          (currentFileBytes, phase) => {
-            activeBytes.set(index, currentFileBytes)
-            emitProgress(index, file, phase)
-          }
-        )
+        await downloadAndVerifyFile(file, (currentFileBytes, phase) => {
+          activeBytes.set(index, currentFileBytes)
+          emitProgress(index, file, phase)
+        })
 
         activeBytes.delete(index)
         completedBytes += file.size
@@ -1924,10 +2731,7 @@ function findZipEndOfCentralDirectory(buffer: Buffer): number {
   throw new Error('Nie znaleziono końca archiwum ZIP.')
 }
 
-function isExcludedNativeEntry(
-  entryName: string,
-  excludes: string[]
-): boolean {
+function isExcludedNativeEntry(entryName: string, excludes: string[]): boolean {
   const normalizedName = entryName.replace(/\\/g, '/').toLowerCase()
 
   return excludes.some((exclude) => {
@@ -1936,8 +2740,10 @@ function isExcludedNativeEntry(
       .replace(/^\/+/, '')
       .toLowerCase()
 
-    return normalizedExclude.length > 0 &&
+    return (
+      normalizedExclude.length > 0 &&
       normalizedName.startsWith(normalizedExclude)
+    )
   })
 }
 
@@ -1984,12 +2790,7 @@ async function extractNativeArchive(
     const completeEntryLength =
       46 + fileNameLength + extraLength + commentLength
 
-    assertZipRange(
-      buffer,
-      offset,
-      completeEntryLength,
-      archive.file.label
-    )
+    assertZipRange(buffer, offset, completeEntryLength, archive.file.label)
 
     const entryName = buffer
       .subarray(offset + 46, offset + 46 + fileNameLength)
@@ -2038,12 +2839,7 @@ async function extractNativeArchive(
     const dataOffset =
       localHeaderOffset + 30 + localFileNameLength + localExtraLength
 
-    assertZipRange(
-      buffer,
-      dataOffset,
-      compressedSize,
-      archive.file.label
-    )
+    assertZipRange(buffer, dataOffset, compressedSize, archive.file.label)
 
     const compressedData = buffer.subarray(
       dataOffset,
@@ -2191,10 +2987,7 @@ async function installMinecraftVersion(
       )
     )
 
-    const plan = await getMinecraftInstallPlan(
-      versionId,
-      safeGameDirectory
-    )
+    const plan = await getMinecraftInstallPlan(versionId, safeGameDirectory)
 
     libraryCount = plan.libraryFiles.length
     assetCount = plan.assetFiles.length
@@ -2204,7 +2997,8 @@ async function installMinecraftVersion(
       mkdir(plan.paths.versionDirectory, { recursive: true }),
       mkdir(plan.paths.librariesDirectory, { recursive: true }),
       mkdir(plan.paths.assetIndexesDirectory, { recursive: true }),
-      mkdir(plan.paths.assetObjectsDirectory, { recursive: true })
+      mkdir(plan.paths.assetObjectsDirectory, { recursive: true }),
+      mkdir(plan.paths.logConfigsDirectory, { recursive: true })
     ])
 
     await writeFile(
@@ -2271,8 +3065,7 @@ async function installMinecraftVersion(
         libraryCount,
         assetCount,
         nativeArchiveCount,
-        extractedNativeFileCount:
-          nativeExtractionBefore.extractedFileCount,
+        extractedNativeFileCount: nativeExtractionBefore.extractedFileCount,
         downloadedFileCount: 0,
         error: null
       }
@@ -2365,6 +3158,644 @@ async function installMinecraftVersion(
   }
 }
 
+function parseJavaMajorVersion(version: string | null): number | null {
+  if (!version) {
+    return null
+  }
+
+  const normalized = version.trim()
+  const legacyMatch = normalized.match(/^1\.(\d+)/)
+
+  if (legacyMatch) {
+    return Number(legacyMatch[1])
+  }
+
+  const modernMatch = normalized.match(/^(\d+)/)
+  return modernMatch ? Number(modernMatch[1]) : null
+}
+
+async function findJavaExecutable(): Promise<string | null> {
+  const javaHome = process.env['JAVA_HOME']?.trim()
+
+  if (javaHome) {
+    const candidate = join(
+      javaHome,
+      'bin',
+      process.platform === 'win32' ? 'java.exe' : 'java'
+    )
+
+    if (existsSync(candidate)) {
+      return candidate
+    }
+  }
+
+  return findJavaPath()
+}
+
+function splitLegacyArguments(value: string): string[] {
+  const result: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  let escaped = false
+
+  for (const character of value) {
+    if (escaped) {
+      current += character
+      escaped = false
+      continue
+    }
+
+    if (character === '\\') {
+      escaped = true
+      continue
+    }
+
+    if (quote) {
+      if (character === quote) {
+        quote = null
+      } else {
+        current += character
+      }
+
+      continue
+    }
+
+    if (character === '"' || character === "'") {
+      quote = character
+      continue
+    }
+
+    if (/\s/.test(character)) {
+      if (current) {
+        result.push(current)
+        current = ''
+      }
+
+      continue
+    }
+
+    current += character
+  }
+
+  if (escaped) {
+    current += '\\'
+  }
+
+  if (quote) {
+    throw new Error(
+      'Argumenty starszej wersji zawierają niedomknięty cudzysłów.'
+    )
+  }
+
+  if (current) {
+    result.push(current)
+  }
+
+  return result
+}
+
+function evaluateMinecraftArguments(
+  argumentsList: MinecraftArgument[] | undefined,
+  features: Record<string, boolean>
+): string[] {
+  if (!argumentsList) {
+    return []
+  }
+
+  const result: string[] = []
+
+  for (const argument of argumentsList) {
+    if (typeof argument === 'string') {
+      result.push(argument)
+      continue
+    }
+
+    if (
+      !argument ||
+      typeof argument !== 'object' ||
+      !('value' in argument) ||
+      !areRulesAllowed(argument.rules, features)
+    ) {
+      continue
+    }
+
+    if (Array.isArray(argument.value)) {
+      result.push(...argument.value)
+    } else if (typeof argument.value === 'string') {
+      result.push(argument.value)
+    }
+  }
+
+  return result
+}
+
+function replaceLaunchVariables(
+  argument: string,
+  variables: Record<string, string>
+): string {
+  const replaced = argument.replace(
+    /\$\{([^}]+)\}/g,
+    (fullMatch, variableName: string) =>
+      Object.hasOwn(variables, variableName)
+        ? variables[variableName]
+        : fullMatch
+  )
+
+  const unresolvedVariable = replaced.match(/\$\{([^}]+)\}/)
+
+  if (unresolvedVariable) {
+    throw new Error(
+      `Nieobsługiwana zmienna uruchamiania: ${unresolvedVariable[1]}.`
+    )
+  }
+
+  return replaced
+}
+
+async function ensureLaunchFileExists(
+  filePath: string,
+  label: string
+): Promise<void> {
+  try {
+    const fileStat = await stat(filePath)
+
+    if (!fileStat.isFile() || fileStat.size <= 0) {
+      throw new Error(`${label} jest pusty lub nie jest plikiem.`)
+    }
+  } catch (error) {
+    if (isFileNotFound(error)) {
+      throw new Error(`${label} nie istnieje. Użyj opcji Sprawdź / napraw.`)
+    }
+
+    throw error
+  }
+}
+
+async function buildMinecraftClasspath(
+  metadata: MinecraftVersionMetadata,
+  paths: VersionPaths
+): Promise<string> {
+  const classpathEntries: string[] = []
+  const usedEntries = new Set<string>()
+
+  for (const library of metadata.libraries ?? []) {
+    if (!isLibraryAllowed(library)) {
+      continue
+    }
+
+    const artifact = library.downloads?.artifact
+
+    if (!artifact) {
+      continue
+    }
+
+    const libraryPath = resolveSafeChildPath(
+      paths.librariesDirectory,
+      artifact.path,
+      `Biblioteka ${library.name}`
+    )
+    const pathKey = getPathKey(libraryPath)
+
+    if (!usedEntries.has(pathKey)) {
+      await ensureLaunchFileExists(libraryPath, `Biblioteka ${library.name}`)
+      usedEntries.add(pathKey)
+      classpathEntries.push(libraryPath)
+    }
+  }
+
+  await ensureLaunchFileExists(paths.jarPath, 'Plik klienta Minecraft')
+  classpathEntries.push(paths.jarPath)
+
+  return classpathEntries.join(delimiter)
+}
+
+function sendGameLog(
+  owner: WebContents,
+  stream: MinecraftGameLog['stream'],
+  message: string
+): void {
+  const log: MinecraftGameLog = {
+    stream,
+    message,
+    timestamp: new Date().toISOString()
+  }
+
+  if (!owner.isDestroyed()) {
+    owner.send('minecraft:game-log', log)
+  }
+
+  if (activeMinecraftGame?.owner === owner) {
+    activeMinecraftGame.logStream.write(
+      `[${log.timestamp}] [${stream}] ${message}`
+    )
+  }
+}
+
+function updateGameState(owner: WebContents, state: MinecraftGameState): void {
+  lastMinecraftGameState = state
+
+  if (!owner.isDestroyed()) {
+    owner.send('minecraft:game-state', state)
+  }
+}
+
+function getCurrentGameState(): MinecraftGameState {
+  if (activeMinecraftGame) {
+    return {
+      phase: 'running',
+      running: true,
+      pid: activeMinecraftGame.child.pid ?? null,
+      startedAt: activeMinecraftGame.startedAt,
+      exitCode: null,
+      signal: null,
+      message: 'Minecraft jest uruchomiony.'
+    }
+  }
+
+  return lastMinecraftGameState
+}
+
+function getLaunchFeatures(isDemoUser: boolean): Record<string, boolean> {
+  return {
+    has_custom_resolution: true,
+    is_demo_user: isDemoUser,
+    has_quick_plays_support: false,
+    is_quick_play_singleplayer: false,
+    is_quick_play_multiplayer: false,
+    is_quick_play_realms: false
+  }
+}
+
+async function buildMinecraftLaunchArguments(
+  request: MinecraftLaunchRequest,
+  metadata: MinecraftVersionMetadata,
+  paths: VersionPaths,
+  javaInfo: JavaInfo
+): Promise<{
+  javaPath: string
+  argumentsList: string[]
+  mode: MinecraftRunMode
+}> {
+  if (!Number.isInteger(request.ram) || request.ram < 2 || request.ram > 16) {
+    throw new Error('Pamięć RAM musi wynosić od 2 do 16 GB.')
+  }
+
+  const javaPath = await findJavaExecutable()
+
+  if (!javaPath || !javaInfo.installed) {
+    throw new Error(
+      'Nie znaleziono programu Java potrzebnego do uruchomienia gry.'
+    )
+  }
+
+  const installedJavaMajor = parseJavaMajorVersion(javaInfo.version)
+  const requiredJavaMajor = metadata.javaVersion?.majorVersion ?? null
+
+  if (
+    requiredJavaMajor !== null &&
+    installedJavaMajor !== null &&
+    installedJavaMajor < requiredJavaMajor
+  ) {
+    throw new Error(
+      `Minecraft ${metadata.id} wymaga Java ${requiredJavaMajor}, a wykryto Java ${installedJavaMajor}.`
+    )
+  }
+
+  if (!metadata.mainClass) {
+    throw new Error('Metadane wersji nie zawierają klasy startowej.')
+  }
+
+  const classpath = await buildMinecraftClasspath(metadata, paths)
+  const assetIndexId = metadata.assetIndex?.id
+
+  if (!assetIndexId) {
+    throw new Error('Metadane wersji nie zawierają identyfikatora assetów.')
+  }
+
+  await mkdir(paths.nativesDirectory, { recursive: true })
+  await mkdir(request.gameDirectory, { recursive: true })
+
+  const microsoftSession = await ensureMicrosoftSession()
+  const features = getLaunchFeatures(false)
+  const variables: Record<string, string> = {
+    auth_player_name: microsoftSession.username,
+    version_name: metadata.id,
+    game_directory: request.gameDirectory,
+    assets_root: paths.assetsDirectory,
+    game_assets: paths.assetsDirectory,
+    assets_index_name: assetIndexId,
+    auth_uuid: microsoftSession.id,
+    auth_access_token: microsoftSession.minecraftAccessToken,
+    auth_session: microsoftSession.minecraftAccessToken,
+    clientid: MICROSOFT_CLIENT_ID,
+    auth_xuid: microsoftSession.xuid,
+    user_type: 'msa',
+    version_type: metadata.type ?? 'release',
+    user_properties: '{}',
+    profile_name: microsoftSession.username,
+    profile_id: microsoftSession.id,
+    natives_directory: paths.nativesDirectory,
+    launcher_name: 'aurora-launcher',
+    launcher_version: '0.12.0',
+    classpath,
+    classpath_separator: delimiter,
+    library_directory: paths.librariesDirectory,
+    primary_jar: paths.jarPath,
+    resolution_width: '1280',
+    resolution_height: '720'
+  }
+
+  const rawJvmArguments = evaluateMinecraftArguments(
+    metadata.arguments?.jvm,
+    features
+  )
+  const rawGameArguments = metadata.arguments?.game
+    ? evaluateMinecraftArguments(metadata.arguments.game, features)
+    : splitLegacyArguments(metadata.minecraftArguments ?? '')
+
+  if (rawGameArguments.length === 0) {
+    throw new Error('Metadane wersji nie zawierają argumentów gry.')
+  }
+
+  const jvmArguments = rawJvmArguments
+    .map((argument) => replaceLaunchVariables(argument, variables))
+    .filter(
+      (argument) => !argument.startsWith('-Xmx') && !argument.startsWith('-Xms')
+    )
+
+  const hasClasspathArgument = jvmArguments.some(
+    (argument, index) =>
+      argument === '-cp' ||
+      argument === '-classpath' ||
+      (index > 0 &&
+        (jvmArguments[index - 1] === '-cp' ||
+          jvmArguments[index - 1] === '-classpath'))
+  )
+
+  if (!hasClasspathArgument) {
+    jvmArguments.push('-cp', classpath)
+  }
+
+  const loggingClient = metadata.logging?.client
+
+  if (loggingClient?.argument && loggingClient.file) {
+    const logConfigPath = join(paths.logConfigsDirectory, loggingClient.file.id)
+
+    await ensureLaunchFileExists(logConfigPath, 'Konfiguracja logów Minecraft')
+
+    jvmArguments.push(
+      replaceLaunchVariables(loggingClient.argument, {
+        ...variables,
+        path: logConfigPath
+      })
+    )
+  }
+
+  const gameArguments = rawGameArguments.map((argument) =>
+    replaceLaunchVariables(argument, variables)
+  )
+
+  return {
+    javaPath,
+    mode: 'microsoft',
+    argumentsList: [
+      '-Xms512M',
+      `-Xmx${request.ram}G`,
+      '-Dfile.encoding=UTF-8',
+      '-Dlauncher.brand=aurora-launcher',
+      '-Dlauncher.version=0.12.0',
+      ...jvmArguments,
+      metadata.mainClass,
+      ...gameArguments
+    ]
+  }
+}
+
+async function launchMinecraftGame(
+  sender: WebContents,
+  request: MinecraftLaunchRequest
+): Promise<MinecraftLaunchResult> {
+  try {
+    if (activeMinecraftGame) {
+      return {
+        success: false,
+        running: true,
+        pid: activeMinecraftGame.child.pid ?? null,
+        mode: 'microsoft',
+        error: 'Minecraft jest już uruchomiony.'
+      }
+    }
+
+    if (!SUPPORTED_VERSIONS.has(request.versionId)) {
+      throw new Error('Wybrana wersja Minecrafta nie jest obsługiwana.')
+    }
+
+    const safeGameDirectory = validateGameDirectory(request.gameDirectory)
+    const safeRequest: MinecraftLaunchRequest = {
+      ...request,
+      gameDirectory: safeGameDirectory,
+      profileName: request.profileName.trim().slice(0, 80)
+    }
+    const paths = getVersionPaths(safeGameDirectory, request.versionId)
+    const localMetadataText = await readFile(paths.jsonPath, 'utf8')
+    const metadata = JSON.parse(localMetadataText) as MinecraftVersionMetadata
+
+    if (!metadata || metadata.id !== request.versionId) {
+      throw new Error(
+        'Lokalny plik metadanych wersji jest nieprawidłowy. Użyj opcji Sprawdź / napraw.'
+      )
+    }
+
+    const javaInfo = await detectJava()
+    const launchData = await buildMinecraftLaunchArguments(
+      safeRequest,
+      metadata,
+      paths,
+      javaInfo
+    )
+    const launcherWindow = BrowserWindow.fromWebContents(sender)
+    const logsDirectory = join(safeGameDirectory, 'logs')
+    const launcherLogPath = join(logsDirectory, 'aurora-launcher-latest.log')
+
+    await mkdir(logsDirectory, { recursive: true })
+
+    updateGameState(sender, {
+      phase: 'starting',
+      running: false,
+      pid: null,
+      startedAt: null,
+      exitCode: null,
+      signal: null,
+      message: `Uruchamianie Minecraft ${request.versionId} z kontem Microsoft...`
+    })
+
+    const logStream = createWriteStream(launcherLogPath, {
+      flags: 'w',
+      encoding: 'utf8'
+    })
+    const child = spawn(launchData.javaPath, launchData.argumentsList, {
+      cwd: safeGameDirectory,
+      windowsHide: true,
+      stdio: 'pipe'
+    })
+    const startedAt = new Date().toISOString()
+
+    activeMinecraftGame = {
+      child,
+      owner: sender,
+      launcherWindow,
+      startedAt,
+      logStream,
+      hiddenByLauncher: false
+    }
+
+    child.stdin.end()
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+
+    child.stdout.on('data', (chunk: string) => {
+      sendGameLog(sender, 'stdout', chunk)
+    })
+
+    child.stderr.on('data', (chunk: string) => {
+      sendGameLog(sender, 'stderr', chunk)
+    })
+
+    child.on('error', (error) => {
+      sendGameLog(sender, 'system', `Błąd procesu Java: ${error.message}\n`)
+    })
+
+    child.on('close', (exitCode, signal) => {
+      const game = activeMinecraftGame
+      const wasHidden = game?.hiddenByLauncher === true
+      const windowToRestore = game?.launcherWindow ?? launcherWindow
+      const message =
+        exitCode === 0
+          ? 'Minecraft został zamknięty poprawnie.'
+          : `Minecraft zakończył działanie z kodem ${exitCode ?? 'brak'}.`
+
+      sendGameLog(sender, 'system', `${message}\n`)
+      game?.logStream.end()
+      activeMinecraftGame = null
+
+      updateGameState(sender, {
+        phase: exitCode === 0 ? 'stopped' : 'error',
+        running: false,
+        pid: null,
+        startedAt,
+        exitCode,
+        signal,
+        message
+      })
+
+      if (wasHidden && windowToRestore && !windowToRestore.isDestroyed()) {
+        windowToRestore.show()
+        windowToRestore.focus()
+      }
+    })
+
+    await new Promise<void>((resolveSpawn, rejectSpawn) => {
+      const handleSpawn = (): void => {
+        child.off('error', handleError)
+        resolveSpawn()
+      }
+      const handleError = (error: Error): void => {
+        child.off('spawn', handleSpawn)
+        rejectSpawn(error)
+      }
+
+      child.once('spawn', handleSpawn)
+      child.once('error', handleError)
+    })
+
+    sendGameLog(
+      sender,
+      'system',
+      `Uruchomiono ${safeRequest.profileName || 'Minecraft'} jako ${activeMicrosoftSession?.username ?? 'konto Microsoft'}.\n` +
+        `Tryb: Microsoft · PID: ${child.pid ?? 'brak'}\n`
+    )
+
+    updateGameState(sender, {
+      phase: 'running',
+      running: true,
+      pid: child.pid ?? null,
+      startedAt,
+      exitCode: null,
+      signal: null,
+      message: 'Minecraft działa z uwierzytelnionym kontem Microsoft.'
+    })
+
+    if (launcherWindow && !launcherWindow.isDestroyed()) {
+      if (safeRequest.closeOnLaunch) {
+        if (activeMinecraftGame) {
+          activeMinecraftGame.hiddenByLauncher = true
+        }
+        launcherWindow.hide()
+      } else if (safeRequest.minimizeOnLaunch) {
+        launcherWindow.minimize()
+      }
+    }
+
+    return {
+      success: true,
+      running: true,
+      pid: child.pid ?? null,
+      mode: launchData.mode,
+      error: null
+    }
+  } catch (error) {
+    const message = getErrorMessage(error)
+
+    if (activeMinecraftGame) {
+      activeMinecraftGame.logStream.end()
+      activeMinecraftGame = null
+    }
+
+    updateGameState(sender, {
+      phase: 'error',
+      running: false,
+      pid: null,
+      startedAt: null,
+      exitCode: null,
+      signal: null,
+      message
+    })
+
+    return {
+      success: false,
+      running: false,
+      pid: null,
+      mode: null,
+      error: message
+    }
+  }
+}
+
+async function stopMinecraftGame(): Promise<boolean> {
+  const game = activeMinecraftGame
+
+  if (!game) {
+    return false
+  }
+
+  sendGameLog(game.owner, 'system', 'Wysyłanie polecenia zatrzymania gry...\n')
+
+  if (process.platform === 'win32' && game.child.pid) {
+    try {
+      await execFileAsync(
+        'taskkill.exe',
+        ['/PID', String(game.child.pid), '/T'],
+        { windowsHide: true }
+      )
+      return true
+    } catch {
+      return game.child.kill()
+    }
+  }
+
+  return game.child.kill('SIGTERM')
+}
+
 function getDefaultGameDirectory(): string {
   return join(app.getPath('appData'), 'AuroraLauncher')
 }
@@ -2374,9 +3805,7 @@ async function chooseGameDirectory(
   currentPath: string | null
 ): Promise<string | null> {
   const defaultPath =
-    currentPath &&
-    isAbsolute(currentPath) &&
-    existsSync(currentPath)
+    currentPath && isAbsolute(currentPath) && existsSync(currentPath)
       ? currentPath
       : app.getPath('appData')
 
@@ -2430,13 +3859,9 @@ function createWindow(): void {
   })
 
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    void mainWindow.loadURL(
-      process.env['ELECTRON_RENDERER_URL']
-    )
+    void mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    void mainWindow.loadFile(
-      join(__dirname, '../renderer/index.html')
-    )
+    void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
@@ -2461,10 +3886,7 @@ app.whenReady().then(() => {
         )
       }
 
-      return checkMinecraftVersion(
-        versionId,
-        forceRefresh === true
-      )
+      return checkMinecraftVersion(versionId, forceRefresh === true)
     }
   )
 
@@ -2478,20 +3900,14 @@ app.whenReady().then(() => {
         )
       }
 
-      return getMinecraftVersionDetails(
-        versionId,
-        forceRefresh === true
-      )
+      return getMinecraftVersionDetails(versionId, forceRefresh === true)
     }
   )
 
   ipcMain.handle(
     'minecraft:get-install-status',
     async (_event, versionId: unknown, gameDirectory: unknown) => {
-      if (
-        typeof versionId !== 'string' ||
-        typeof gameDirectory !== 'string'
-      ) {
+      if (typeof versionId !== 'string' || typeof gameDirectory !== 'string') {
         return {
           versionId: '',
           installed: false,
@@ -2529,10 +3945,7 @@ app.whenReady().then(() => {
   ipcMain.handle(
     'minecraft:install-version',
     async (event, versionId: unknown, gameDirectory: unknown) => {
-      if (
-        typeof versionId !== 'string' ||
-        typeof gameDirectory !== 'string'
-      ) {
+      if (typeof versionId !== 'string' || typeof gameDirectory !== 'string') {
         return {
           success: false,
           alreadyInstalled: false,
@@ -2547,13 +3960,65 @@ app.whenReady().then(() => {
         } satisfies MinecraftInstallResult
       }
 
-      return installMinecraftVersion(
-        event.sender,
-        versionId,
-        gameDirectory
-      )
+      return installMinecraftVersion(event.sender, versionId, gameDirectory)
     }
   )
+
+  ipcMain.handle('auth:get-microsoft-account', async () => {
+    return getMicrosoftAccountState()
+  })
+
+  ipcMain.handle('auth:login-microsoft', async () => {
+    return loginMicrosoftAccount()
+  })
+
+  ipcMain.handle('auth:logout-microsoft', async () => {
+    return logoutMicrosoftAccount()
+  })
+
+  ipcMain.handle('minecraft:launch-game', async (event, request: unknown) => {
+    if (!request || typeof request !== 'object') {
+      return {
+        success: false,
+        running: false,
+        pid: null,
+        mode: null,
+        error: 'Nieprawidłowe dane uruchamiania gry.'
+      } satisfies MinecraftLaunchResult
+    }
+
+    const launchRequest = request as Partial<MinecraftLaunchRequest>
+
+    if (
+      typeof launchRequest.versionId !== 'string' ||
+      typeof launchRequest.gameDirectory !== 'string' ||
+      typeof launchRequest.ram !== 'number' ||
+      typeof launchRequest.profileName !== 'string' ||
+      typeof launchRequest.minimizeOnLaunch !== 'boolean' ||
+      typeof launchRequest.closeOnLaunch !== 'boolean'
+    ) {
+      return {
+        success: false,
+        running: false,
+        pid: null,
+        mode: null,
+        error: 'Nieprawidłowe dane uruchamiania gry.'
+      } satisfies MinecraftLaunchResult
+    }
+
+    return launchMinecraftGame(
+      event.sender,
+      launchRequest as MinecraftLaunchRequest
+    )
+  })
+
+  ipcMain.handle('minecraft:get-game-state', () => {
+    return getCurrentGameState()
+  })
+
+  ipcMain.handle('minecraft:stop-game', async () => {
+    return stopMinecraftGame()
+  })
 
   ipcMain.handle('folder:get-default-game-directory', () => {
     return getDefaultGameDirectory()
@@ -2562,9 +4027,7 @@ app.whenReady().then(() => {
   ipcMain.handle(
     'folder:choose-game-directory',
     async (event, currentPath: unknown) => {
-      const parentWindow = BrowserWindow.fromWebContents(
-        event.sender
-      )
+      const parentWindow = BrowserWindow.fromWebContents(event.sender)
 
       return chooseGameDirectory(
         parentWindow,

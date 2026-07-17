@@ -45,12 +45,7 @@ interface MinecraftVersionDetails {
 }
 
 type InstallPhase =
-  | 'checking'
-  | 'downloading'
-  | 'verifying'
-  | 'extracting'
-  | 'complete'
-  | 'error'
+  'checking' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error'
 
 interface MinecraftInstallProgress {
   versionId: string
@@ -110,6 +105,55 @@ interface MinecraftInstallResult {
   error: string | null
 }
 
+type MinecraftRunMode = 'microsoft'
+type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
+
+interface MicrosoftAccountState {
+  signedIn: boolean
+  hasMinecraft: boolean
+  username: string | null
+  id: string | null
+  xuid: string | null
+  error: string | null
+}
+
+interface MicrosoftLoginResult extends MicrosoftAccountState {
+  success: boolean
+}
+
+interface MinecraftLaunchRequest {
+  versionId: string
+  gameDirectory: string
+  ram: number
+  profileName: string
+  minimizeOnLaunch: boolean
+  closeOnLaunch: boolean
+}
+
+interface MinecraftLaunchResult {
+  success: boolean
+  running: boolean
+  pid: number | null
+  mode: MinecraftRunMode | null
+  error: string | null
+}
+
+interface MinecraftGameState {
+  phase: MinecraftGamePhase
+  running: boolean
+  pid: number | null
+  startedAt: string | null
+  exitCode: number | null
+  signal: string | null
+  message: string
+}
+
+interface MinecraftGameLog {
+  stream: 'system' | 'stdout' | 'stderr'
+  message: string
+  timestamp: string
+}
+
 interface AuroraAPI {
   getJavaInfo: () => Promise<JavaInfo>
 
@@ -139,11 +183,29 @@ interface AuroraAPI {
 
   removeInstallProgressListener: () => void
 
+  getMicrosoftAccount: () => Promise<MicrosoftAccountState>
+
+  loginMicrosoft: () => Promise<MicrosoftLoginResult>
+
+  logoutMicrosoft: () => Promise<boolean>
+
+  launchMinecraftGame: (
+    request: MinecraftLaunchRequest
+  ) => Promise<MinecraftLaunchResult>
+
+  getMinecraftGameState: () => Promise<MinecraftGameState>
+
+  stopMinecraftGame: () => Promise<boolean>
+
+  onGameLog: (callback: (log: MinecraftGameLog) => void) => void
+
+  onGameState: (callback: (state: MinecraftGameState) => void) => void
+
+  removeGameListeners: () => void
+
   getDefaultGameDirectory: () => Promise<string>
 
-  chooseGameDirectory: (
-    currentPath: string | null
-  ) => Promise<string | null>
+  chooseGameDirectory: (currentPath: string | null) => Promise<string | null>
 }
 
 const api: AuroraAPI = {
@@ -210,6 +272,63 @@ const api: AuroraAPI = {
 
   removeInstallProgressListener: (): void => {
     ipcRenderer.removeAllListeners('minecraft:install-progress')
+  },
+
+  getMicrosoftAccount: async (): Promise<MicrosoftAccountState> => {
+    return ipcRenderer.invoke(
+      'auth:get-microsoft-account'
+    ) as Promise<MicrosoftAccountState>
+  },
+
+  loginMicrosoft: async (): Promise<MicrosoftLoginResult> => {
+    return ipcRenderer.invoke(
+      'auth:login-microsoft'
+    ) as Promise<MicrosoftLoginResult>
+  },
+
+  logoutMicrosoft: async (): Promise<boolean> => {
+    return ipcRenderer.invoke('auth:logout-microsoft') as Promise<boolean>
+  },
+
+  launchMinecraftGame: async (
+    request: MinecraftLaunchRequest
+  ): Promise<MinecraftLaunchResult> => {
+    return ipcRenderer.invoke(
+      'minecraft:launch-game',
+      request
+    ) as Promise<MinecraftLaunchResult>
+  },
+
+  getMinecraftGameState: async (): Promise<MinecraftGameState> => {
+    return ipcRenderer.invoke(
+      'minecraft:get-game-state'
+    ) as Promise<MinecraftGameState>
+  },
+
+  stopMinecraftGame: async (): Promise<boolean> => {
+    return ipcRenderer.invoke('minecraft:stop-game') as Promise<boolean>
+  },
+
+  onGameLog: (callback: (log: MinecraftGameLog) => void): void => {
+    ipcRenderer.removeAllListeners('minecraft:game-log')
+    ipcRenderer.on('minecraft:game-log', (_event, log: MinecraftGameLog) => {
+      callback(log)
+    })
+  },
+
+  onGameState: (callback: (state: MinecraftGameState) => void): void => {
+    ipcRenderer.removeAllListeners('minecraft:game-state')
+    ipcRenderer.on(
+      'minecraft:game-state',
+      (_event, state: MinecraftGameState) => {
+        callback(state)
+      }
+    )
+  },
+
+  removeGameListeners: (): void => {
+    ipcRenderer.removeAllListeners('minecraft:game-log')
+    ipcRenderer.removeAllListeners('minecraft:game-state')
   },
 
   getDefaultGameDirectory: async (): Promise<string> => {

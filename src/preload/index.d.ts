@@ -44,12 +44,7 @@ interface MinecraftVersionDetails {
 }
 
 type InstallPhase =
-  | 'checking'
-  | 'downloading'
-  | 'verifying'
-  | 'extracting'
-  | 'complete'
-  | 'error'
+  'checking' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error'
 
 interface MinecraftInstallProgress {
   versionId: string
@@ -109,6 +104,55 @@ interface MinecraftInstallResult {
   error: string | null
 }
 
+type MinecraftRunMode = 'microsoft'
+type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
+
+interface MicrosoftAccountState {
+  signedIn: boolean
+  hasMinecraft: boolean
+  username: string | null
+  id: string | null
+  xuid: string | null
+  error: string | null
+}
+
+interface MicrosoftLoginResult extends MicrosoftAccountState {
+  success: boolean
+}
+
+interface MinecraftLaunchRequest {
+  versionId: string
+  gameDirectory: string
+  ram: number
+  profileName: string
+  minimizeOnLaunch: boolean
+  closeOnLaunch: boolean
+}
+
+interface MinecraftLaunchResult {
+  success: boolean
+  running: boolean
+  pid: number | null
+  mode: MinecraftRunMode | null
+  error: string | null
+}
+
+interface MinecraftGameState {
+  phase: MinecraftGamePhase
+  running: boolean
+  pid: number | null
+  startedAt: string | null
+  exitCode: number | null
+  signal: string | null
+  message: string
+}
+
+interface MinecraftGameLog {
+  stream: 'system' | 'stdout' | 'stderr'
+  message: string
+  timestamp: string
+}
+
 interface AuroraAPI {
   getJavaInfo: () => Promise<JavaInfo>
 
@@ -138,11 +182,29 @@ interface AuroraAPI {
 
   removeInstallProgressListener: () => void
 
+  getMicrosoftAccount: () => Promise<MicrosoftAccountState>
+
+  loginMicrosoft: () => Promise<MicrosoftLoginResult>
+
+  logoutMicrosoft: () => Promise<boolean>
+
+  launchMinecraftGame: (
+    request: MinecraftLaunchRequest
+  ) => Promise<MinecraftLaunchResult>
+
+  getMinecraftGameState: () => Promise<MinecraftGameState>
+
+  stopMinecraftGame: () => Promise<boolean>
+
+  onGameLog: (callback: (log: MinecraftGameLog) => void) => void
+
+  onGameState: (callback: (state: MinecraftGameState) => void) => void
+
+  removeGameListeners: () => void
+
   getDefaultGameDirectory: () => Promise<string>
 
-  chooseGameDirectory: (
-    currentPath: string | null
-  ) => Promise<string | null>
+  chooseGameDirectory: (currentPath: string | null) => Promise<string | null>
 }
 
 declare global {
