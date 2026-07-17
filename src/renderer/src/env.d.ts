@@ -106,7 +106,7 @@ interface MinecraftInstallResult {
   error: string | null
 }
 
-type MinecraftRunMode = 'microsoft'
+type MinecraftRunMode = 'demo' | 'microsoft'
 type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
 
 interface MicrosoftAccountState {
@@ -125,6 +125,8 @@ interface MicrosoftLoginResult extends MicrosoftAccountState {
 interface MinecraftLaunchRequest {
   versionId: string
   gameDirectory: string
+  username: string
+  accountType: 'local' | 'microsoft'
   ram: number
   profileName: string
   minimizeOnLaunch: boolean

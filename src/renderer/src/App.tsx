@@ -107,7 +107,7 @@ interface MinecraftInstallStatus {
   error: string | null
 }
 
-type MinecraftRunMode = 'microsoft'
+type MinecraftRunMode = 'microsoft' | 'ui-test'
 type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
 
 interface MinecraftLaunchResult {
@@ -801,6 +801,8 @@ function App(): React.JSX.Element {
         await window.api.launchMinecraftGame({
           versionId: minecraftVersion,
           gameDirectory,
+          launchMode: 'microsoft',
+          username: null,
           ram,
           profileName: selectedProfileName,
           minimizeOnLaunch,
@@ -818,6 +820,59 @@ function App(): React.JSX.Element {
     } catch (error) {
       console.error('Nie udało się uruchomić gry:', error)
       alert('Nie udało się połączyć z procesem uruchamiającym grę.')
+      setGameLogOpen(true)
+    } finally {
+      setLaunching(false)
+    }
+  }
+
+  async function launchUiTest(): Promise<void> {
+    if (!installStatus?.valid) {
+      alert('Najpierw zainstaluj lub napraw wybraną wersję Minecrafta.')
+      return
+    }
+
+    if (!javaInfo?.installed) {
+      alert('Nie wykryto Javy. Sprawdź ustawienia.')
+      return
+    }
+
+    if (gameState.running || launching) {
+      setGameLogOpen(true)
+      return
+    }
+
+    const randomNumber = Math.floor(1000 + Math.random() * 9000)
+    const testUsername = `AuroraTest${randomNumber}`
+
+    persistSettings()
+    setLaunching(true)
+    setGameLogs([])
+
+    try {
+      const result: MinecraftLaunchResult =
+        await window.api.launchMinecraftGame({
+          versionId: minecraftVersion,
+          gameDirectory,
+          launchMode: 'ui-test',
+          username: testUsername,
+          ram,
+          profileName: 'Aurora UI Test',
+          minimizeOnLaunch: false,
+          closeOnLaunch: false
+        })
+
+      if (!result.success) {
+        alert(
+          `Nie udało się uruchomić testu interfejsu.\n\n${
+            result.error ?? 'Nieznany błąd.'
+          }`
+        )
+        setGameLogOpen(true)
+      }
+    } catch (error) {
+      console.error('Nie udało się uruchomić testu UI:', error)
+      alert('Nie udało się połączyć z procesem uruchamiającym test UI.')
       setGameLogOpen(true)
     } finally {
       setLaunching(false)
@@ -1394,6 +1449,41 @@ function App(): React.JSX.Element {
                       : microsoftAccount.signedIn
                         ? 'Wyloguj'
                         : 'Zaloguj'}
+                  </button>
+                </div>
+              </article>
+
+              <article className="settings-card">
+                <div className="setting-top">
+                  <div>
+                    <h2>Tryb testowy interfejsu</h2>
+                    <p>
+                      Narzędzie deweloperskie do sprawdzania menu i grafiki
+                      Aurora Client bez logowania Microsoft.
+                    </p>
+                  </div>
+
+                  <strong>UI TEST · DEMO</strong>
+                </div>
+
+                <div className="folder-row">
+                  <code>
+                    Uruchamia oficjalne demo z losowym nickiem AuroraTest####.
+                    Nie daje dostępu do pełnej gry ani serwerów premium.
+                  </code>
+
+                  <button
+                    type="button"
+                    className="small-button"
+                    disabled={
+                      launching ||
+                      gameState.running ||
+                      !installStatus?.valid ||
+                      !javaInfo?.installed
+                    }
+                    onClick={() => void launchUiTest()}
+                  >
+                    {launching ? 'Uruchamianie...' : 'Uruchom test UI'}
                   </button>
                 </div>
               </article>

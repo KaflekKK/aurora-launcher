@@ -296,7 +296,7 @@ interface MinecraftInstallResult {
   error: string | null
 }
 
-type MinecraftRunMode = 'microsoft'
+type MinecraftRunMode = 'microsoft' | 'ui-test'
 type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
 
 interface MicrosoftAccountState {
@@ -315,6 +315,8 @@ interface MicrosoftLoginResult extends MicrosoftAccountState {
 interface MinecraftLaunchRequest {
   versionId: string
   gameDirectory: string
+  launchMode: MinecraftRunMode
+  username: string | null
   ram: number
   profileName: string
   minimizeOnLaunch: boolean
@@ -3415,6 +3417,25 @@ function getCurrentGameState(): MinecraftGameState {
   return lastMinecraftGameState
 }
 
+function createOfflineUuid(username: string): string {
+  const digest = createHash('md5')
+    .update(`OfflinePlayer:${username}`, 'utf8')
+    .digest()
+
+  digest[6] = (digest[6] & 0x0f) | 0x30
+  digest[8] = (digest[8] & 0x3f) | 0x80
+
+  const hex = digest.toString('hex')
+
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20)
+  ].join('-')
+}
+
 function getLaunchFeatures(isDemoUser: boolean): Record<string, boolean> {
   return {
     has_custom_resolution: true,
@@ -3475,28 +3496,60 @@ async function buildMinecraftLaunchArguments(
   await mkdir(paths.nativesDirectory, { recursive: true })
   await mkdir(request.gameDirectory, { recursive: true })
 
-  const microsoftSession = await ensureMicrosoftSession()
-  const features = getLaunchFeatures(false)
+  let username: string
+  let uuid: string
+  let accessToken: string
+  let xuid: string
+  let clientId: string
+  let userType: string
+  let mode: MinecraftRunMode
+
+  if (request.launchMode === 'microsoft') {
+    const microsoftSession = await ensureMicrosoftSession()
+    username = microsoftSession.username
+    uuid = microsoftSession.id
+    accessToken = microsoftSession.minecraftAccessToken
+    xuid = microsoftSession.xuid
+    clientId = MICROSOFT_CLIENT_ID
+    userType = 'msa'
+    mode = 'microsoft'
+  } else {
+    const testUsername = request.username?.trim() ?? ''
+
+    if (!/^AuroraTest[0-9]{4}$/.test(testUsername)) {
+      throw new Error('Nieprawidłowy nick testowy interfejsu.')
+    }
+
+    username = testUsername
+    uuid = createOfflineUuid(testUsername)
+    accessToken = '0'
+    xuid = '0'
+    clientId = '0'
+    userType = 'legacy'
+    mode = 'ui-test'
+  }
+
+  const features = getLaunchFeatures(mode === 'ui-test')
   const variables: Record<string, string> = {
-    auth_player_name: microsoftSession.username,
+    auth_player_name: username,
     version_name: metadata.id,
     game_directory: request.gameDirectory,
     assets_root: paths.assetsDirectory,
     game_assets: paths.assetsDirectory,
     assets_index_name: assetIndexId,
-    auth_uuid: microsoftSession.id,
-    auth_access_token: microsoftSession.minecraftAccessToken,
-    auth_session: microsoftSession.minecraftAccessToken,
-    clientid: MICROSOFT_CLIENT_ID,
-    auth_xuid: microsoftSession.xuid,
-    user_type: 'msa',
+    auth_uuid: uuid,
+    auth_access_token: accessToken,
+    auth_session: accessToken,
+    clientid: clientId,
+    auth_xuid: xuid,
+    user_type: userType,
     version_type: metadata.type ?? 'release',
     user_properties: '{}',
-    profile_name: microsoftSession.username,
-    profile_id: microsoftSession.id,
+    profile_name: username,
+    profile_id: uuid,
     natives_directory: paths.nativesDirectory,
     launcher_name: 'aurora-launcher',
-    launcher_version: '0.12.0',
+    launcher_version: '0.14.0',
     classpath,
     classpath_separator: delimiter,
     library_directory: paths.librariesDirectory,
@@ -3555,15 +3608,19 @@ async function buildMinecraftLaunchArguments(
     replaceLaunchVariables(argument, variables)
   )
 
+  if (mode === 'ui-test' && !gameArguments.includes('--demo')) {
+    gameArguments.push('--demo')
+  }
+
   return {
     javaPath,
-    mode: 'microsoft',
+    mode,
     argumentsList: [
       '-Xms512M',
       `-Xmx${request.ram}G`,
       '-Dfile.encoding=UTF-8',
       '-Dlauncher.brand=aurora-launcher',
-      '-Dlauncher.version=0.12.0',
+      '-Dlauncher.version=0.14.0',
       ...jvmArguments,
       metadata.mainClass,
       ...gameArguments
@@ -3581,7 +3638,7 @@ async function launchMinecraftGame(
         success: false,
         running: true,
         pid: activeMinecraftGame.child.pid ?? null,
-        mode: 'microsoft',
+        mode: null,
         error: 'Minecraft jest już uruchomiony.'
       }
     }
@@ -3711,8 +3768,8 @@ async function launchMinecraftGame(
     sendGameLog(
       sender,
       'system',
-      `Uruchomiono ${safeRequest.profileName || 'Minecraft'} jako ${activeMicrosoftSession?.username ?? 'konto Microsoft'}.\n` +
-        `Tryb: Microsoft · PID: ${child.pid ?? 'brak'}\n`
+      `Uruchomiono ${safeRequest.profileName || 'Minecraft'} jako ${launchData.mode === 'ui-test' ? safeRequest.username : activeMicrosoftSession?.username ?? 'konto Microsoft'}.\n` +
+        `Tryb: ${launchData.mode === 'ui-test' ? 'UI Test · demo' : 'Microsoft'} · PID: ${child.pid ?? 'brak'}\n`
     )
 
     updateGameState(sender, {
@@ -3722,7 +3779,10 @@ async function launchMinecraftGame(
       startedAt,
       exitCode: null,
       signal: null,
-      message: 'Minecraft działa z uwierzytelnionym kontem Microsoft.'
+      message:
+        launchData.mode === 'ui-test'
+          ? 'Minecraft działa w trybie testowym interfejsu (demo).'
+          : 'Minecraft działa z uwierzytelnionym kontem Microsoft.'
     })
 
     if (launcherWindow && !launcherWindow.isDestroyed()) {
@@ -3992,6 +4052,10 @@ app.whenReady().then(() => {
     if (
       typeof launchRequest.versionId !== 'string' ||
       typeof launchRequest.gameDirectory !== 'string' ||
+      (launchRequest.launchMode !== 'microsoft' &&
+        launchRequest.launchMode !== 'ui-test') ||
+      (launchRequest.username !== null &&
+        typeof launchRequest.username !== 'string') ||
       typeof launchRequest.ram !== 'number' ||
       typeof launchRequest.profileName !== 'string' ||
       typeof launchRequest.minimizeOnLaunch !== 'boolean' ||
