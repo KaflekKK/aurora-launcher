@@ -14,6 +14,7 @@ type InstallPhase =
   | 'checking'
   | 'downloading'
   | 'verifying'
+  | 'extracting'
   | 'complete'
   | 'error'
 
@@ -99,10 +100,25 @@ interface MinecraftInstallStatus {
   currentSha1: string | null
   expectedSha1: string | null
   clientValid: boolean
+
   libraryCount: number
   validLibraryCount: number
   missingLibraryCount: number
   invalidLibraryCount: number
+
+  assetIndexValid: boolean
+  assetCount: number
+  validAssetCount: number
+  missingAssetCount: number
+  invalidAssetCount: number
+
+  nativeArchiveCount: number
+  validNativeArchiveCount: number
+  missingNativeArchiveCount: number
+  invalidNativeArchiveCount: number
+  nativesExtracted: boolean
+  nativeFileCount: number
+
   totalExpectedSize: number | null
   error: string | null
 }
@@ -467,8 +483,19 @@ function App(): React.JSX.Element {
           validLibraryCount: 0,
           missingLibraryCount: 0,
           invalidLibraryCount: 0,
+          assetIndexValid: false,
+          assetCount: 0,
+          validAssetCount: 0,
+          missingAssetCount: 0,
+          invalidAssetCount: 0,
+          nativeArchiveCount: 0,
+          validNativeArchiveCount: 0,
+          missingNativeArchiveCount: 0,
+          invalidNativeArchiveCount: 0,
+          nativesExtracted: false,
+          nativeFileCount: 0,
           totalExpectedSize: null,
-          error: 'Nie udało się sprawdzić klienta i bibliotek.'
+          error: 'Nie udało się sprawdzić pełnej instalacji gry.'
         })
       } finally {
         if (requestId === installStatusRequestId.current) {
@@ -685,10 +712,13 @@ function App(): React.JSX.Element {
 
       alert(
         result.alreadyInstalled
-          ? `Minecraft ${minecraftVersion} oraz biblioteki są już poprawnie zainstalowane.`
+          ? `Minecraft ${minecraftVersion} jest już kompletnie zainstalowany.`
           : `Pobrano i sprawdzono pliki Minecraft ${minecraftVersion}.\n\n` +
               `Klient: ${result.jarPath ?? 'brak ścieżki'}\n` +
               `Biblioteki: ${result.libraryCount}\n` +
+              `Assety: ${result.assetCount}\n` +
+              `Archiwa native: ${result.nativeArchiveCount}\n` +
+              `Rozpakowane pliki native: ${result.extractedNativeFileCount}\n` +
               `Pobrane pliki: ${result.downloadedFileCount}`
       )
     } catch (error) {
@@ -750,8 +780,11 @@ function App(): React.JSX.Element {
         `RAM: ${ram} GB\n` +
         `Java: ${javaInfo.version ?? 'nieznana'}\n` +
         `Plik klienta: poprawny\n` +
-        `Biblioteki: ${installStatus.validLibraryCount}/${installStatus.libraryCount}\n\n` +
-        `Assety, pliki native i prawdziwe uruchamianie dodamy w kolejnych etapach.`
+        `Biblioteki: ${installStatus.validLibraryCount}/${installStatus.libraryCount}\n` +
+        `Assety: ${installStatus.validAssetCount}/${installStatus.assetCount}\n` +
+        `Archiwa native: ${installStatus.validNativeArchiveCount}/${installStatus.nativeArchiveCount}\n` +
+        `Rozpakowane native: ${installStatus.nativeFileCount}\n\n` +
+        `Instalacja gry jest kompletna. Prawdziwe uruchamianie dodamy w następnym etapie.`
     )
   }
 
@@ -802,22 +835,19 @@ function App(): React.JSX.Element {
     }
 
     if (installStatusLoading) {
-      return 'Sprawdzanie klienta i bibliotek...'
+      return 'Sprawdzanie klienta, bibliotek, assetów i natives...'
     }
 
     if (installStatus?.valid) {
       return (
-        `Zainstalowana · klient + ` +
-        `${installStatus.validLibraryCount}/${installStatus.libraryCount} bibliotek`
+        `Zainstalowana · ${installStatus.validLibraryCount}/${installStatus.libraryCount} bibliotek · ` +
+        `${installStatus.validAssetCount}/${installStatus.assetCount} assetów · ` +
+        `${installStatus.nativeFileCount} plików native`
       )
     }
 
     if (installStatus?.error) {
       return installStatus.error
-    }
-
-    if (installStatus && installStatus.missingLibraryCount > 0) {
-      return `Brakuje bibliotek: ${installStatus.missingLibraryCount}`
     }
 
     return 'Wymaga instalacji'
@@ -946,7 +976,7 @@ function App(): React.JSX.Element {
             </div>
           </button>
 
-          <span className="app-version">Aurora Launcher v0.9.0</span>
+          <span className="app-version">Aurora Launcher v0.10.0</span>
         </div>
       </aside>
 
@@ -1222,7 +1252,7 @@ function App(): React.JSX.Element {
                   <div>
                     <h2>Instalacja gry</h2>
                     <p>
-                      Oficjalny klient oraz biblioteki wybranej wersji Minecrafta.
+                      Klient, biblioteki, assety oraz pliki native wybranej wersji Minecrafta.
                     </p>
                   </div>
 
@@ -1274,20 +1304,44 @@ function App(): React.JSX.Element {
                     }}
                   >
                     <DetailItem
-                      label="Poprawne biblioteki"
+                      label="Biblioteki"
                       value={`${installStatus.validLibraryCount}/${installStatus.libraryCount}`}
                     />
                     <DetailItem
-                      label="Brakujące"
-                      value={`${installStatus.missingLibraryCount}`}
+                      label="Assety"
+                      value={`${installStatus.validAssetCount}/${installStatus.assetCount}`}
                     />
                     <DetailItem
-                      label="Uszkodzone"
-                      value={`${installStatus.invalidLibraryCount}`}
+                      label="Archiwa native"
+                      value={`${installStatus.validNativeArchiveCount}/${installStatus.nativeArchiveCount}`}
+                    />
+                    <DetailItem
+                      label="Rozpakowane native"
+                      value={
+                        installStatus.nativesExtracted
+                          ? `${installStatus.nativeFileCount}`
+                          : 'Brak'
+                      }
+                    />
+                    <DetailItem
+                      label="Brakujące pliki"
+                      value={`${
+                        installStatus.missingLibraryCount +
+                        installStatus.missingAssetCount +
+                        installStatus.missingNativeArchiveCount +
+                        (installStatus.assetIndexValid ? 0 : 1)
+                      }`}
+                    />
+                    <DetailItem
+                      label="Uszkodzone pliki"
+                      value={`${
+                        installStatus.invalidLibraryCount +
+                        installStatus.invalidAssetCount +
+                        installStatus.invalidNativeArchiveCount
+                      }`}
                     />
                   </div>
                 )}
-
                 {(installing || installProgress) && (
                   <div style={{ marginTop: '16px' }}>
                     <div

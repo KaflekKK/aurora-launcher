@@ -15,6 +15,7 @@ import { release as getOsRelease } from 'node:os'
 import {
   mkdir,
   open,
+  readFile,
   rename,
   rm,
   stat,
@@ -22,6 +23,7 @@ import {
 } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
+import { inflateRawSync } from 'node:zlib'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 
@@ -102,8 +104,24 @@ interface MinecraftLibrary {
   name: string
   downloads?: {
     artifact?: MinecraftLibraryArtifact
+    classifiers?: Record<string, MinecraftLibraryArtifact>
+  }
+  natives?: Partial<Record<'windows' | 'osx' | 'linux', string>>
+  extract?: {
+    exclude?: string[]
   }
   rules?: MinecraftLibraryRule[]
+}
+
+interface MinecraftAssetObject {
+  hash: string
+  size: number
+}
+
+interface MinecraftAssetIndexFile {
+  objects: Record<string, MinecraftAssetObject>
+  virtual?: boolean
+  map_to_resources?: boolean
 }
 
 interface MinecraftVersionMetadata {
@@ -176,6 +194,7 @@ type InstallPhase =
   | 'checking'
   | 'downloading'
   | 'verifying'
+  | 'extracting'
   | 'complete'
   | 'error'
 
@@ -201,10 +220,25 @@ interface MinecraftInstallStatus {
   currentSha1: string | null
   expectedSha1: string | null
   clientValid: boolean
+
   libraryCount: number
   validLibraryCount: number
   missingLibraryCount: number
   invalidLibraryCount: number
+
+  assetIndexValid: boolean
+  assetCount: number
+  validAssetCount: number
+  missingAssetCount: number
+  invalidAssetCount: number
+
+  nativeArchiveCount: number
+  validNativeArchiveCount: number
+  missingNativeArchiveCount: number
+  invalidNativeArchiveCount: number
+  nativesExtracted: boolean
+  nativeFileCount: number
+
   totalExpectedSize: number | null
   error: string | null
 }
@@ -215,6 +249,9 @@ interface MinecraftInstallResult {
   versionId: string
   jarPath: string | null
   libraryCount: number
+  assetCount: number
+  nativeArchiveCount: number
+  extractedNativeFileCount: number
   downloadedFileCount: number
   error: string | null
 }
@@ -227,7 +264,12 @@ interface FileInspection {
   error: string | null
 }
 
-type DownloadFileKind = 'client' | 'library'
+type DownloadFileKind =
+  | 'client'
+  | 'library'
+  | 'asset-index'
+  | 'asset'
+  | 'native'
 
 interface DownloadFile {
   kind: DownloadFileKind
@@ -237,6 +279,46 @@ interface DownloadFile {
   size: number
   targetPath: string
   temporaryPath: string
+}
+
+interface NativeArchive {
+  file: DownloadFile
+  excludes: string[]
+}
+
+interface VersionPaths {
+  versionDirectory: string
+  librariesDirectory: string
+  assetsDirectory: string
+  assetIndexesDirectory: string
+  assetObjectsDirectory: string
+  nativesDirectory: string
+  nativeMarkerPath: string
+  jarPath: string
+  jsonPath: string
+}
+
+interface MinecraftInstallPlan {
+  metadata: MinecraftVersionMetadata
+  paths: VersionPaths
+  clientFile: DownloadFile
+  libraryFiles: DownloadFile[]
+  assetIndexFile: DownloadFile
+  assetFiles: DownloadFile[]
+  nativeArchives: NativeArchive[]
+  allFiles: DownloadFile[]
+}
+
+interface NativeExtractionMarker {
+  versionId: string
+  archiveSha1s: string[]
+  extractedFileCount: number
+}
+
+interface NativeExtractionStatus {
+  valid: boolean
+  extractedFileCount: number
+  error: string | null
 }
 
 interface CacheEntry<T> {
@@ -254,6 +336,11 @@ const versionMetadataCache = new Map<
 const versionDetailsCache = new Map<
   string,
   CacheEntry<MinecraftVersionDetails>
+>()
+
+const assetIndexCache = new Map<
+  string,
+  CacheEntry<MinecraftAssetIndexFile>
 >()
 
 const activeInstallations = new Set<string>()
@@ -410,6 +497,101 @@ async function fetchJson<T>(
   } finally {
     clearTimeout(timeout)
   }
+}
+
+async function fetchBuffer(
+  url: string,
+  errorName: string
+): Promise<Buffer> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 30000)
+
+  try {
+    const response = await net.fetch(getTrustedMinecraftUrl(url), {
+      method: 'GET',
+      signal: controller.signal
+    })
+
+    if (!response.ok) {
+      throw new Error(
+        `${errorName}: serwer zwrócił HTTP ${response.status}.`
+      )
+    }
+
+    return Buffer.from(await response.arrayBuffer())
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function getMinecraftAssetIndex(
+  metadata: MinecraftVersionMetadata,
+  forceRefresh = false
+): Promise<MinecraftAssetIndexFile> {
+  const assetIndex = metadata.assetIndex
+
+  if (!assetIndex) {
+    throw new Error('Ta wersja nie zawiera indeksu assetów.')
+  }
+
+  validateDownloadProperties(
+    'Indeks assetów',
+    assetIndex.url,
+    assetIndex.sha1,
+    assetIndex.size
+  )
+
+  const cacheKey = `${assetIndex.id}:${assetIndex.sha1}`
+  const cachedIndex = assetIndexCache.get(cacheKey)
+
+  if (
+    !forceRefresh &&
+    cachedIndex &&
+    isCacheFresh(cachedIndex.loadedAt)
+  ) {
+    return cachedIndex.data
+  }
+
+  const buffer = await fetchBuffer(
+    assetIndex.url,
+    `Nie udało się pobrać indeksu assetów ${assetIndex.id}`
+  )
+
+  if (buffer.length !== assetIndex.size) {
+    throw new Error(
+      `Indeks assetów ma rozmiar ${buffer.length} bajtów, oczekiwano ${assetIndex.size}.`
+    )
+  }
+
+  const sha1 = createHash('sha1').update(buffer).digest('hex')
+
+  if (sha1.toLowerCase() !== assetIndex.sha1.toLowerCase()) {
+    throw new Error('Indeks assetów ma nieprawidłową sumę SHA-1.')
+  }
+
+  let parsed: MinecraftAssetIndexFile
+
+  try {
+    parsed = JSON.parse(buffer.toString('utf8')) as MinecraftAssetIndexFile
+  } catch {
+    throw new Error('Indeks assetów nie jest prawidłowym plikiem JSON.')
+  }
+
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    !parsed.objects ||
+    typeof parsed.objects !== 'object'
+  ) {
+    throw new Error('Indeks assetów ma nieprawidłowy format.')
+  }
+
+  assetIndexCache.set(cacheKey, {
+    data: parsed,
+    loadedAt: Date.now()
+  })
+
+  return parsed
 }
 
 async function getMinecraftManifest(
@@ -677,6 +859,18 @@ function getMinecraftArchitecture(): string {
   return process.arch
 }
 
+function getNativeClassifierArchitecture(): string {
+  if (process.arch === 'ia32') {
+    return '32'
+  }
+
+  if (process.arch === 'x64') {
+    return '64'
+  }
+
+  return process.arch
+}
+
 function matchesRule(rule: MinecraftLibraryRule): boolean {
   if (rule.os?.name && rule.os.name !== getMinecraftOsName()) {
     return false
@@ -723,6 +917,21 @@ function isLibraryAllowed(library: MinecraftLibrary): boolean {
   return allowed
 }
 
+function getNativeClassifier(
+  library: MinecraftLibrary
+): string | null {
+  const template = library.natives?.[getMinecraftOsName()]
+
+  if (!template) {
+    return null
+  }
+
+  return template.replace(
+    /\$\{arch\}/g,
+    getNativeClassifierArchitecture()
+  )
+}
+
 function validateDownloadProperties(
   label: string,
   url: string,
@@ -735,34 +944,44 @@ function validateDownloadProperties(
     throw new Error(`${label} ma nieprawidłową sumę SHA-1.`)
   }
 
-  if (!Number.isSafeInteger(size) || size <= 0) {
+  if (!Number.isSafeInteger(size) || size < 0) {
     throw new Error(`${label} ma nieprawidłowy rozmiar.`)
   }
 }
 
-function resolveSafeLibraryPath(
-  librariesDirectory: string,
-  artifactPath: string
+function resolveSafeChildPath(
+  baseDirectory: string,
+  childPath: string,
+  label: string
 ): string {
-  const normalizedPath = artifactPath.replace(/\\/g, '/')
+  const normalizedPath = childPath.replace(/\\/g, '/')
 
-  if (!normalizedPath || normalizedPath.includes('\u0000')) {
-    throw new Error('Biblioteka ma nieprawidłową ścieżkę.')
+  if (
+    !normalizedPath ||
+    normalizedPath.includes('\u0000') ||
+    normalizedPath.startsWith('/')
+  ) {
+    throw new Error(`${label} ma nieprawidłową ścieżkę.`)
   }
 
-  const targetPath = resolve(
-    librariesDirectory,
-    ...normalizedPath.split('/').filter(Boolean)
-  )
+  const pathParts = normalizedPath.split('/').filter(Boolean)
 
-  const relativePath = relative(librariesDirectory, targetPath)
+  if (
+    pathParts.length === 0 ||
+    pathParts.some((part) => part === '.' || part === '..')
+  ) {
+    throw new Error(`${label} ma nieprawidłową ścieżkę.`)
+  }
+
+  const targetPath = resolve(baseDirectory, ...pathParts)
+  const relativePath = relative(baseDirectory, targetPath)
 
   if (
     !relativePath ||
     relativePath.startsWith('..') ||
     isAbsolute(relativePath)
   ) {
-    throw new Error('Biblioteka wskazuje ścieżkę poza folderem gry.')
+    throw new Error(`${label} wskazuje ścieżkę poza folderem gry.`)
   }
 
   return targetPath
@@ -781,13 +1000,7 @@ function validateGameDirectory(gameDirectory: string): string {
 function getVersionPaths(
   gameDirectory: string,
   versionId: string
-): {
-  versionDirectory: string
-  librariesDirectory: string
-  jarPath: string
-  jsonPath: string
-  temporaryPath: string
-} {
+): VersionPaths {
   if (!SUPPORTED_VERSIONS.has(versionId)) {
     throw new Error(
       'Ta wersja nie jest obsługiwana przez Aurora Launcher.'
@@ -800,93 +1013,252 @@ function getVersionPaths(
     'versions',
     versionId
   )
+  const assetsDirectory = join(safeGameDirectory, 'assets')
+  const nativesDirectory = join(
+    versionDirectory,
+    `${versionId}-natives`
+  )
 
   return {
     versionDirectory,
     librariesDirectory: join(safeGameDirectory, 'libraries'),
+    assetsDirectory,
+    assetIndexesDirectory: join(assetsDirectory, 'indexes'),
+    assetObjectsDirectory: join(assetsDirectory, 'objects'),
+    nativesDirectory,
+    nativeMarkerPath: join(nativesDirectory, '.aurora-natives.json'),
     jarPath: join(versionDirectory, `${versionId}.jar`),
-    jsonPath: join(versionDirectory, `${versionId}.json`),
-    temporaryPath: join(versionDirectory, `${versionId}.jar.part`)
+    jsonPath: join(versionDirectory, `${versionId}.json`)
   }
 }
 
-function getDownloadFiles(
-  metadata: MinecraftVersionMetadata,
-  gameDirectory: string
-): DownloadFile[] {
+function getPathKey(filePath: string): string {
+  return process.platform === 'win32'
+    ? filePath.toLowerCase()
+    : filePath
+}
+
+function createDownloadFile(
+  kind: DownloadFileKind,
+  label: string,
+  artifact: MinecraftLibraryArtifact | MinecraftDownload,
+  targetPath: string
+): DownloadFile {
+  validateDownloadProperties(
+    label,
+    artifact.url,
+    artifact.sha1,
+    artifact.size
+  )
+
+  return {
+    kind,
+    label,
+    url: getTrustedMinecraftUrl(artifact.url),
+    sha1: artifact.sha1,
+    size: artifact.size,
+    targetPath,
+    temporaryPath: `${targetPath}.part`
+  }
+}
+
+async function getMinecraftInstallPlan(
+  versionId: string,
+  gameDirectory: string,
+  forceRefresh = false
+): Promise<MinecraftInstallPlan> {
+  const metadata = await getMinecraftVersionMetadata(
+    versionId,
+    forceRefresh
+  )
+  const paths = getVersionPaths(gameDirectory, versionId)
   const client = metadata.downloads?.client
 
   if (!client) {
     throw new Error('Ta wersja nie zawiera pliku klienta.')
   }
 
-  validateDownloadProperties(
-    'Plik klienta',
-    client.url,
-    client.sha1,
-    client.size
+  const clientFile = createDownloadFile(
+    'client',
+    `Klient Minecraft ${metadata.id}`,
+    client,
+    paths.jarPath
   )
 
-  const paths = getVersionPaths(gameDirectory, metadata.id)
-  const files: DownloadFile[] = [
-    {
-      kind: 'client',
-      label: `Klient Minecraft ${metadata.id}`,
-      url: getTrustedMinecraftUrl(client.url),
-      sha1: client.sha1,
-      size: client.size,
-      targetPath: paths.jarPath,
-      temporaryPath: paths.temporaryPath
-    }
-  ]
+  const usedPaths = new Set<string>([getPathKey(clientFile.targetPath)])
+  const libraryFiles: DownloadFile[] = []
+  const nativeArchives: NativeArchive[] = []
 
-  const usedPaths = new Set<string>([paths.jarPath.toLowerCase()])
+  const addUniqueFile = (
+    collection: DownloadFile[],
+    file: DownloadFile
+  ): boolean => {
+    const pathKey = getPathKey(file.targetPath)
+
+    if (usedPaths.has(pathKey)) {
+      return false
+    }
+
+    usedPaths.add(pathKey)
+    collection.push(file)
+    return true
+  }
 
   for (const library of metadata.libraries ?? []) {
     if (!isLibraryAllowed(library)) {
       continue
     }
 
+    let hasDownload = false
     const artifact = library.downloads?.artifact
 
-    if (!artifact) {
+    if (artifact) {
+      const targetPath = resolveSafeChildPath(
+        paths.librariesDirectory,
+        artifact.path,
+        `Biblioteka ${library.name}`
+      )
+
+      const file = createDownloadFile(
+        'library',
+        library.name,
+        artifact,
+        targetPath
+      )
+
+      addUniqueFile(libraryFiles, file)
+      hasDownload = true
+    }
+
+    const nativeClassifier = getNativeClassifier(library)
+
+    if (nativeClassifier) {
+      const nativeArtifact =
+        library.downloads?.classifiers?.[nativeClassifier]
+
+      if (!nativeArtifact) {
+        throw new Error(
+          `Biblioteka ${library.name} nie zawiera pliku native ${nativeClassifier}.`
+        )
+      }
+
+      const nativeTargetPath = resolveSafeChildPath(
+        paths.librariesDirectory,
+        nativeArtifact.path,
+        `Plik native ${library.name}`
+      )
+
+      const nativeFile = createDownloadFile(
+        'native',
+        `${library.name} (${nativeClassifier})`,
+        nativeArtifact,
+        nativeTargetPath
+      )
+
+      const nativeFiles: DownloadFile[] = []
+
+      if (addUniqueFile(nativeFiles, nativeFile)) {
+        nativeArchives.push({
+          file: nativeFile,
+          excludes: [
+            'META-INF/',
+            ...(library.extract?.exclude ?? [])
+          ]
+        })
+      }
+
+      hasDownload = true
+    }
+
+    if (!hasDownload) {
       throw new Error(
-        `Biblioteka ${library.name} nie zawiera pliku artifact.`
+        `Biblioteka ${library.name} nie zawiera pliku do pobrania.`
       )
     }
-
-    validateDownloadProperties(
-      `Biblioteka ${library.name}`,
-      artifact.url,
-      artifact.sha1,
-      artifact.size
-    )
-
-    const targetPath = resolveSafeLibraryPath(
-      paths.librariesDirectory,
-      artifact.path
-    )
-
-    const pathKey = targetPath.toLowerCase()
-
-    if (usedPaths.has(pathKey)) {
-      continue
-    }
-
-    usedPaths.add(pathKey)
-
-    files.push({
-      kind: 'library',
-      label: library.name,
-      url: getTrustedMinecraftUrl(artifact.url),
-      sha1: artifact.sha1,
-      size: artifact.size,
-      targetPath,
-      temporaryPath: `${targetPath}.part`
-    })
   }
 
-  return files
+  const assetIndexMetadata = metadata.assetIndex
+
+  if (!assetIndexMetadata) {
+    throw new Error('Ta wersja nie zawiera indeksu assetów.')
+  }
+
+  if (!/^[A-Za-z0-9._-]+$/.test(assetIndexMetadata.id)) {
+    throw new Error('Indeks assetów ma nieprawidłowy identyfikator.')
+  }
+
+  const assetIndex = await getMinecraftAssetIndex(
+    metadata,
+    forceRefresh
+  )
+
+  const assetIndexFile = createDownloadFile(
+    'asset-index',
+    `Indeks assetów ${assetIndexMetadata.id}`,
+    assetIndexMetadata,
+    join(
+      paths.assetIndexesDirectory,
+      `${assetIndexMetadata.id}.json`
+    )
+  )
+
+  usedPaths.add(getPathKey(assetIndexFile.targetPath))
+
+  const assetFiles: DownloadFile[] = []
+
+  for (const [assetName, asset] of Object.entries(assetIndex.objects)) {
+    if (!asset || typeof asset !== 'object') {
+      throw new Error(`Asset ${assetName} ma nieprawidłowe dane.`)
+    }
+
+    if (!/^[a-f0-9]{40}$/i.test(asset.hash)) {
+      throw new Error(`Asset ${assetName} ma nieprawidłowy hash.`)
+    }
+
+    if (!Number.isSafeInteger(asset.size) || asset.size < 0) {
+      throw new Error(`Asset ${assetName} ma nieprawidłowy rozmiar.`)
+    }
+
+    const hash = asset.hash.toLowerCase()
+    const targetPath = resolveSafeChildPath(
+      paths.assetObjectsDirectory,
+      `${hash.slice(0, 2)}/${hash}`,
+      `Asset ${assetName}`
+    )
+
+    const assetFile: DownloadFile = {
+      kind: 'asset',
+      label: `Asset ${assetName}`,
+      url: getTrustedMinecraftUrl(
+        `https://resources.download.minecraft.net/${hash.slice(0, 2)}/${hash}`
+      ),
+      sha1: hash,
+      size: asset.size,
+      targetPath,
+      temporaryPath: `${targetPath}.part`
+    }
+
+    addUniqueFile(assetFiles, assetFile)
+  }
+
+  const nativeFiles = nativeArchives.map((archive) => archive.file)
+
+  return {
+    metadata,
+    paths,
+    clientFile,
+    libraryFiles,
+    assetIndexFile,
+    assetFiles,
+    nativeArchives,
+    allFiles: [
+      clientFile,
+      ...libraryFiles,
+      ...nativeFiles,
+      assetIndexFile,
+      ...assetFiles
+    ]
+  }
 }
 
 async function calculateFileSha1(filePath: string): Promise<string> {
@@ -901,7 +1273,8 @@ async function calculateFileSha1(filePath: string): Promise<string> {
 }
 
 async function inspectDownloadFile(
-  file: DownloadFile
+  file: DownloadFile,
+  verifyHash = true
 ): Promise<FileInspection> {
   try {
     const fileStats = await stat(file.targetPath)
@@ -923,6 +1296,16 @@ async function inspectDownloadFile(
         size: fileStats.size,
         sha1: null,
         error: 'Rozmiar pliku jest nieprawidłowy.'
+      }
+    }
+
+    if (!verifyHash) {
+      return {
+        exists: true,
+        valid: true,
+        size: fileStats.size,
+        sha1: null,
+        error: null
       }
     }
 
@@ -957,41 +1340,188 @@ async function inspectDownloadFile(
   }
 }
 
+async function inspectDownloadFiles(
+  files: DownloadFile[],
+  shouldVerifyHash: (file: DownloadFile) => boolean,
+  onInspected?: (completed: number, total: number, file: DownloadFile) => void
+): Promise<FileInspection[]> {
+  const results = new Array<FileInspection>(files.length)
+  let nextIndex = 0
+  let completed = 0
+  const workerCount = Math.min(24, Math.max(1, files.length))
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = nextIndex
+      nextIndex += 1
+
+      if (index >= files.length) {
+        return
+      }
+
+      const file = files[index]
+      results[index] = await inspectDownloadFile(
+        file,
+        shouldVerifyHash(file)
+      )
+      completed += 1
+      onInspected?.(completed, files.length, file)
+    }
+  })
+
+  await Promise.all(workers)
+  return results
+}
+
+function countFileStates(
+  inspections: FileInspection[]
+): {
+  valid: number
+  missing: number
+  invalid: number
+} {
+  let valid = 0
+  let missing = 0
+  let invalid = 0
+
+  for (const inspection of inspections) {
+    if (inspection.valid) {
+      valid += 1
+    } else if (!inspection.exists) {
+      missing += 1
+    } else {
+      invalid += 1
+    }
+  }
+
+  return {
+    valid,
+    missing,
+    invalid
+  }
+}
+
+function getExpectedNativeArchiveSha1s(
+  plan: MinecraftInstallPlan
+): string[] {
+  return plan.nativeArchives
+    .map((archive) => archive.file.sha1.toLowerCase())
+    .sort()
+}
+
+async function inspectNativeExtraction(
+  plan: MinecraftInstallPlan
+): Promise<NativeExtractionStatus> {
+  if (plan.nativeArchives.length === 0) {
+    return {
+      valid: true,
+      extractedFileCount: 0,
+      error: null
+    }
+  }
+
+  try {
+    const directoryStats = await stat(plan.paths.nativesDirectory)
+
+    if (!directoryStats.isDirectory()) {
+      return {
+        valid: false,
+        extractedFileCount: 0,
+        error: 'Ścieżka natives nie jest folderem.'
+      }
+    }
+
+    const markerText = await readFile(plan.paths.nativeMarkerPath, 'utf8')
+    const marker = JSON.parse(markerText) as Partial<NativeExtractionMarker>
+    const expectedSha1s = getExpectedNativeArchiveSha1s(plan)
+    const markerSha1s = Array.isArray(marker.archiveSha1s)
+      ? marker.archiveSha1s
+          .filter((value): value is string => typeof value === 'string')
+          .map((value) => value.toLowerCase())
+          .sort()
+      : []
+
+    const extractedFileCount =
+      typeof marker.extractedFileCount === 'number' &&
+      Number.isSafeInteger(marker.extractedFileCount) &&
+      marker.extractedFileCount >= 0
+        ? marker.extractedFileCount
+        : 0
+
+    const valid =
+      marker.versionId === plan.metadata.id &&
+      extractedFileCount > 0 &&
+      markerSha1s.length === expectedSha1s.length &&
+      markerSha1s.every((sha1, index) => sha1 === expectedSha1s[index])
+
+    return {
+      valid,
+      extractedFileCount,
+      error: valid ? null : 'Pliki native wymagają ponownego rozpakowania.'
+    }
+  } catch (error) {
+    if (isFileNotFound(error)) {
+      return {
+        valid: false,
+        extractedFileCount: 0,
+        error: 'Brakuje rozpakowanych plików native.'
+      }
+    }
+
+    return {
+      valid: false,
+      extractedFileCount: 0,
+      error: getErrorMessage(error)
+    }
+  }
+}
+
 async function getMinecraftInstallStatus(
   versionId: string,
   gameDirectory: string
 ): Promise<MinecraftInstallStatus> {
   try {
-    const metadata = await getMinecraftVersionMetadata(versionId)
-    const files = getDownloadFiles(metadata, gameDirectory)
-    const clientFile = files[0]
-    const libraryFiles = files.slice(1)
-    const clientInspection = await inspectDownloadFile(clientFile)
+    const plan = await getMinecraftInstallPlan(versionId, gameDirectory)
+    const inspections = await inspectDownloadFiles(
+      plan.allFiles,
+      (file) => file.kind !== 'asset'
+    )
+    const inspectionByPath = new Map<string, FileInspection>()
 
-    let validLibraryCount = 0
-    let missingLibraryCount = 0
-    let invalidLibraryCount = 0
-    let firstLibraryError: string | null = null
+    plan.allFiles.forEach((file, index) => {
+      inspectionByPath.set(getPathKey(file.targetPath), inspections[index])
+    })
 
-    for (const libraryFile of libraryFiles) {
-      const inspection = await inspectDownloadFile(libraryFile)
+    const getInspection = (file: DownloadFile): FileInspection => {
+      const inspection = inspectionByPath.get(getPathKey(file.targetPath))
 
-      if (inspection.valid) {
-        validLibraryCount += 1
-      } else if (!inspection.exists) {
-        missingLibraryCount += 1
-      } else {
-        invalidLibraryCount += 1
+      if (!inspection) {
+        throw new Error(`Brakuje wyniku sprawdzania pliku ${file.label}.`)
       }
 
-      if (!firstLibraryError && inspection.error) {
-        firstLibraryError = `${libraryFile.label}: ${inspection.error}`
-      }
+      return inspection
     }
+
+    const clientInspection = getInspection(plan.clientFile)
+    const libraryInspections = plan.libraryFiles.map(getInspection)
+    const assetIndexInspection = getInspection(plan.assetIndexFile)
+    const assetInspections = plan.assetFiles.map(getInspection)
+    const nativeInspections = plan.nativeArchives.map((archive) =>
+      getInspection(archive.file)
+    )
+
+    const libraryStates = countFileStates(libraryInspections)
+    const assetStates = countFileStates(assetInspections)
+    const nativeStates = countFileStates(nativeInspections)
+    const nativeExtraction = await inspectNativeExtraction(plan)
 
     const valid =
       clientInspection.valid &&
-      validLibraryCount === libraryFiles.length
+      libraryStates.valid === plan.libraryFiles.length &&
+      assetIndexInspection.valid &&
+      assetStates.valid === plan.assetFiles.length &&
+      nativeStates.valid === plan.nativeArchives.length &&
+      nativeExtraction.valid
 
     let error: string | null = null
 
@@ -999,30 +1529,58 @@ async function getMinecraftInstallStatus(
       error = clientInspection.error ?? 'Plik klienta jest uszkodzony.'
     } else if (!clientInspection.exists) {
       error = 'Brakuje pliku klienta.'
-    } else if (invalidLibraryCount > 0) {
-      error =
-        firstLibraryError ??
-        `Uszkodzone biblioteki: ${invalidLibraryCount}.`
-    } else if (missingLibraryCount > 0) {
-      error = `Brakuje bibliotek: ${missingLibraryCount}.`
+    } else if (libraryStates.invalid > 0) {
+      error = `Uszkodzone biblioteki: ${libraryStates.invalid}.`
+    } else if (libraryStates.missing > 0) {
+      error = `Brakuje bibliotek: ${libraryStates.missing}.`
+    } else if (!assetIndexInspection.valid) {
+      error = assetIndexInspection.exists
+        ? 'Indeks assetów jest uszkodzony.'
+        : 'Brakuje indeksu assetów.'
+    } else if (assetStates.invalid > 0) {
+      error = `Uszkodzone assety: ${assetStates.invalid}.`
+    } else if (assetStates.missing > 0) {
+      error = `Brakuje assetów: ${assetStates.missing}.`
+    } else if (nativeStates.invalid > 0) {
+      error = `Uszkodzone archiwa native: ${nativeStates.invalid}.`
+    } else if (nativeStates.missing > 0) {
+      error = `Brakuje archiwów native: ${nativeStates.missing}.`
+    } else if (!nativeExtraction.valid) {
+      error = nativeExtraction.error
     }
 
     return {
       versionId,
       installed:
-        clientInspection.exists || validLibraryCount > 0,
+        inspections.some((inspection) => inspection.exists) ||
+        nativeExtraction.extractedFileCount > 0,
       valid,
-      jarPath: clientFile.targetPath,
+      jarPath: plan.clientFile.targetPath,
       currentSize: clientInspection.size,
-      expectedSize: clientFile.size,
+      expectedSize: plan.clientFile.size,
       currentSha1: clientInspection.sha1,
-      expectedSha1: clientFile.sha1,
+      expectedSha1: plan.clientFile.sha1,
       clientValid: clientInspection.valid,
-      libraryCount: libraryFiles.length,
-      validLibraryCount,
-      missingLibraryCount,
-      invalidLibraryCount,
-      totalExpectedSize: files.reduce(
+
+      libraryCount: plan.libraryFiles.length,
+      validLibraryCount: libraryStates.valid,
+      missingLibraryCount: libraryStates.missing,
+      invalidLibraryCount: libraryStates.invalid,
+
+      assetIndexValid: assetIndexInspection.valid,
+      assetCount: plan.assetFiles.length,
+      validAssetCount: assetStates.valid,
+      missingAssetCount: assetStates.missing,
+      invalidAssetCount: assetStates.invalid,
+
+      nativeArchiveCount: plan.nativeArchives.length,
+      validNativeArchiveCount: nativeStates.valid,
+      missingNativeArchiveCount: nativeStates.missing,
+      invalidNativeArchiveCount: nativeStates.invalid,
+      nativesExtracted: nativeExtraction.valid,
+      nativeFileCount: nativeExtraction.extractedFileCount,
+
+      totalExpectedSize: plan.allFiles.reduce(
         (sum, file) => sum + file.size,
         0
       ),
@@ -1039,10 +1597,25 @@ async function getMinecraftInstallStatus(
       currentSha1: null,
       expectedSha1: null,
       clientValid: false,
+
       libraryCount: 0,
       validLibraryCount: 0,
       missingLibraryCount: 0,
       invalidLibraryCount: 0,
+
+      assetIndexValid: false,
+      assetCount: 0,
+      validAssetCount: 0,
+      missingAssetCount: 0,
+      invalidAssetCount: 0,
+
+      nativeArchiveCount: 0,
+      validNativeArchiveCount: 0,
+      missingNativeArchiveCount: 0,
+      invalidNativeArchiveCount: 0,
+      nativesExtracted: false,
+      nativeFileCount: 0,
+
       totalExpectedSize: null,
       error: getErrorMessage(error)
     }
@@ -1095,14 +1668,14 @@ function shortenFileLabel(label: string): string {
   return label.length > 64 ? `${label.slice(0, 61)}...` : label
 }
 
+type DownloadProgressCallback = (
+  currentFileBytes: number,
+  phase: 'downloading' | 'verifying'
+) => void
+
 async function downloadAndVerifyFile(
-  sender: WebContents,
-  versionId: string,
   file: DownloadFile,
-  completedBytes: number,
-  totalBytes: number,
-  completedFiles: number,
-  totalFiles: number
+  onProgress: DownloadProgressCallback
 ): Promise<void> {
   await mkdir(dirname(file.targetPath), {
     recursive: true
@@ -1139,21 +1712,8 @@ async function downloadAndVerifyFile(
     const hash = createHash('sha1')
     let currentFileBytes = 0
     let lastProgressUpdate = 0
-    const shortLabel = shortenFileLabel(file.label)
 
-    sendInstallProgress(
-      sender,
-      createProgress(
-        versionId,
-        'downloading',
-        completedBytes,
-        totalBytes,
-        `Pobieranie: ${shortLabel}`,
-        shortLabel,
-        completedFiles,
-        totalFiles
-      )
-    )
+    onProgress(0, 'downloading')
 
     try {
       while (true) {
@@ -1194,20 +1754,7 @@ async function downloadAndVerifyFile(
           currentFileBytes >= file.size
         ) {
           lastProgressUpdate = now
-
-          sendInstallProgress(
-            sender,
-            createProgress(
-              versionId,
-              'downloading',
-              completedBytes + currentFileBytes,
-              totalBytes,
-              `Pobieranie: ${shortLabel}`,
-              shortLabel,
-              completedFiles,
-              totalFiles
-            )
-          )
+          onProgress(currentFileBytes, 'downloading')
         }
       }
     } finally {
@@ -1215,19 +1762,7 @@ async function downloadAndVerifyFile(
       await fileHandle.close()
     }
 
-    sendInstallProgress(
-      sender,
-      createProgress(
-        versionId,
-        'verifying',
-        completedBytes + currentFileBytes,
-        totalBytes,
-        `Sprawdzanie: ${shortLabel}`,
-        shortLabel,
-        completedFiles,
-        totalFiles
-      )
-    )
+    onProgress(currentFileBytes, 'verifying')
 
     const downloadedSha1 = hash.digest('hex')
 
@@ -1257,6 +1792,358 @@ async function downloadAndVerifyFile(
   }
 }
 
+async function downloadFilesConcurrently(
+  sender: WebContents,
+  versionId: string,
+  files: DownloadFile[]
+): Promise<number> {
+  if (files.length === 0) {
+    return 0
+  }
+
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
+  const activeBytes = new Map<number, number>()
+  let nextIndex = 0
+  let completedBytes = 0
+  let completedFiles = 0
+  let firstError: unknown = null
+  let lastProgressUpdate = 0
+
+  const emitProgress = (
+    _index: number,
+    file: DownloadFile,
+    phase: 'downloading' | 'verifying',
+    force = false
+  ): void => {
+    const now = Date.now()
+
+    if (!force && now - lastProgressUpdate < 100) {
+      return
+    }
+
+    lastProgressUpdate = now
+
+    const activeDownloadedBytes = Array.from(activeBytes.values()).reduce(
+      (sum, value) => sum + value,
+      0
+    )
+    const downloadedBytes = Math.min(
+      totalBytes,
+      completedBytes + activeDownloadedBytes
+    )
+    const shortLabel = shortenFileLabel(file.label)
+
+    sendInstallProgress(
+      sender,
+      createProgress(
+        versionId,
+        phase,
+        downloadedBytes,
+        totalBytes,
+        phase === 'verifying'
+          ? `Sprawdzanie: ${shortLabel}`
+          : `Pobieranie: ${shortLabel}`,
+        shortLabel,
+        completedFiles,
+        files.length
+      )
+    )
+  }
+
+  const workerCount = Math.min(10, files.length)
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (!firstError) {
+      const index = nextIndex
+      nextIndex += 1
+
+      if (index >= files.length) {
+        return
+      }
+
+      const file = files[index]
+      activeBytes.set(index, 0)
+
+      try {
+        await downloadAndVerifyFile(
+          file,
+          (currentFileBytes, phase) => {
+            activeBytes.set(index, currentFileBytes)
+            emitProgress(index, file, phase)
+          }
+        )
+
+        activeBytes.delete(index)
+        completedBytes += file.size
+        completedFiles += 1
+        emitProgress(index, file, 'verifying', true)
+      } catch (error) {
+        activeBytes.delete(index)
+        firstError = error
+        return
+      }
+    }
+  })
+
+  await Promise.all(workers)
+
+  if (firstError) {
+    throw firstError
+  }
+
+  return completedFiles
+}
+
+function assertZipRange(
+  buffer: Buffer,
+  offset: number,
+  length: number,
+  label: string
+): void {
+  if (
+    !Number.isSafeInteger(offset) ||
+    !Number.isSafeInteger(length) ||
+    offset < 0 ||
+    length < 0 ||
+    offset + length > buffer.length
+  ) {
+    throw new Error(`${label}: uszkodzona struktura archiwum ZIP.`)
+  }
+}
+
+function findZipEndOfCentralDirectory(buffer: Buffer): number {
+  const signature = 0x06054b50
+  const minimumOffset = Math.max(0, buffer.length - 65557)
+
+  for (let offset = buffer.length - 22; offset >= minimumOffset; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === signature) {
+      return offset
+    }
+  }
+
+  throw new Error('Nie znaleziono końca archiwum ZIP.')
+}
+
+function isExcludedNativeEntry(
+  entryName: string,
+  excludes: string[]
+): boolean {
+  const normalizedName = entryName.replace(/\\/g, '/').toLowerCase()
+
+  return excludes.some((exclude) => {
+    const normalizedExclude = exclude
+      .replace(/\\/g, '/')
+      .replace(/^\/+/, '')
+      .toLowerCase()
+
+    return normalizedExclude.length > 0 &&
+      normalizedName.startsWith(normalizedExclude)
+  })
+}
+
+async function extractNativeArchive(
+  archive: NativeArchive,
+  nativesDirectory: string,
+  extractedPaths: Set<string>
+): Promise<void> {
+  const buffer = await readFile(archive.file.targetPath)
+  const endOffset = findZipEndOfCentralDirectory(buffer)
+
+  assertZipRange(buffer, endOffset, 22, archive.file.label)
+
+  const entryCount = buffer.readUInt16LE(endOffset + 10)
+  const centralDirectorySize = buffer.readUInt32LE(endOffset + 12)
+  const centralDirectoryOffset = buffer.readUInt32LE(endOffset + 16)
+
+  assertZipRange(
+    buffer,
+    centralDirectoryOffset,
+    centralDirectorySize,
+    archive.file.label
+  )
+
+  let offset = centralDirectoryOffset
+  let totalExtractedBytes = 0
+
+  for (let entryIndex = 0; entryIndex < entryCount; entryIndex += 1) {
+    assertZipRange(buffer, offset, 46, archive.file.label)
+
+    if (buffer.readUInt32LE(offset) !== 0x02014b50) {
+      throw new Error(`${archive.file.label}: uszkodzony katalog ZIP.`)
+    }
+
+    const flags = buffer.readUInt16LE(offset + 8)
+    const compressionMethod = buffer.readUInt16LE(offset + 10)
+    const compressedSize = buffer.readUInt32LE(offset + 20)
+    const uncompressedSize = buffer.readUInt32LE(offset + 24)
+    const fileNameLength = buffer.readUInt16LE(offset + 28)
+    const extraLength = buffer.readUInt16LE(offset + 30)
+    const commentLength = buffer.readUInt16LE(offset + 32)
+    const externalAttributes = buffer.readUInt32LE(offset + 38)
+    const localHeaderOffset = buffer.readUInt32LE(offset + 42)
+    const completeEntryLength =
+      46 + fileNameLength + extraLength + commentLength
+
+    assertZipRange(
+      buffer,
+      offset,
+      completeEntryLength,
+      archive.file.label
+    )
+
+    const entryName = buffer
+      .subarray(offset + 46, offset + 46 + fileNameLength)
+      .toString('utf8')
+      .replace(/\\/g, '/')
+      .replace(/^\/+/, '')
+
+    offset += completeEntryLength
+
+    if (
+      !entryName ||
+      entryName.endsWith('/') ||
+      isExcludedNativeEntry(entryName, archive.excludes)
+    ) {
+      continue
+    }
+
+    if ((flags & 0x0001) !== 0) {
+      throw new Error(`${archive.file.label}: zaszyfrowany wpis ZIP.`)
+    }
+
+    const unixMode = (externalAttributes >>> 16) & 0xffff
+
+    if ((unixMode & 0xf000) === 0xa000) {
+      throw new Error(`${archive.file.label}: niedozwolony link symboliczny.`)
+    }
+
+    if (uncompressedSize > 128 * 1024 * 1024) {
+      throw new Error(`${archive.file.label}: zbyt duży wpis ZIP.`)
+    }
+
+    totalExtractedBytes += uncompressedSize
+
+    if (totalExtractedBytes > 512 * 1024 * 1024) {
+      throw new Error(`${archive.file.label}: archiwum ZIP jest zbyt duże.`)
+    }
+
+    assertZipRange(buffer, localHeaderOffset, 30, archive.file.label)
+
+    if (buffer.readUInt32LE(localHeaderOffset) !== 0x04034b50) {
+      throw new Error(`${archive.file.label}: uszkodzony nagłówek ZIP.`)
+    }
+
+    const localFileNameLength = buffer.readUInt16LE(localHeaderOffset + 26)
+    const localExtraLength = buffer.readUInt16LE(localHeaderOffset + 28)
+    const dataOffset =
+      localHeaderOffset + 30 + localFileNameLength + localExtraLength
+
+    assertZipRange(
+      buffer,
+      dataOffset,
+      compressedSize,
+      archive.file.label
+    )
+
+    const compressedData = buffer.subarray(
+      dataOffset,
+      dataOffset + compressedSize
+    )
+
+    let extractedData: Buffer
+
+    if (compressionMethod === 0) {
+      extractedData = Buffer.from(compressedData)
+    } else if (compressionMethod === 8) {
+      extractedData = inflateRawSync(compressedData)
+    } else {
+      throw new Error(
+        `${archive.file.label}: nieobsługiwana kompresja ZIP ${compressionMethod}.`
+      )
+    }
+
+    if (extractedData.length !== uncompressedSize) {
+      throw new Error(
+        `${archive.file.label}: nieprawidłowy rozmiar rozpakowanego pliku.`
+      )
+    }
+
+    const targetPath = resolveSafeChildPath(
+      nativesDirectory,
+      entryName,
+      `Plik native ${entryName}`
+    )
+
+    await mkdir(dirname(targetPath), {
+      recursive: true
+    })
+
+    await writeFile(targetPath, extractedData)
+    extractedPaths.add(getPathKey(targetPath))
+  }
+}
+
+async function extractNativeArchives(
+  sender: WebContents,
+  plan: MinecraftInstallPlan,
+  downloadedBytes: number,
+  totalBytes: number
+): Promise<number> {
+  if (plan.nativeArchives.length === 0) {
+    return 0
+  }
+
+  await rm(plan.paths.nativesDirectory, {
+    recursive: true,
+    force: true
+  })
+
+  await mkdir(plan.paths.nativesDirectory, {
+    recursive: true
+  })
+
+  const extractedPaths = new Set<string>()
+
+  for (let index = 0; index < plan.nativeArchives.length; index += 1) {
+    const archive = plan.nativeArchives[index]
+    const shortLabel = shortenFileLabel(archive.file.label)
+
+    sendInstallProgress(
+      sender,
+      createProgress(
+        plan.metadata.id,
+        'extracting',
+        downloadedBytes,
+        totalBytes,
+        `Rozpakowywanie native ${index + 1}/${plan.nativeArchives.length}: ${shortLabel}`,
+        shortLabel,
+        index,
+        plan.nativeArchives.length
+      )
+    )
+
+    await extractNativeArchive(
+      archive,
+      plan.paths.nativesDirectory,
+      extractedPaths
+    )
+  }
+
+  const marker: NativeExtractionMarker = {
+    versionId: plan.metadata.id,
+    archiveSha1s: getExpectedNativeArchiveSha1s(plan),
+    extractedFileCount: extractedPaths.size
+  }
+
+  await writeFile(
+    plan.paths.nativeMarkerPath,
+    JSON.stringify(marker, null, 2),
+    'utf8'
+  )
+
+  return extractedPaths.size
+}
+
 async function installMinecraftVersion(
   sender: WebContents,
   versionId: string,
@@ -1264,6 +2151,9 @@ async function installMinecraftVersion(
 ): Promise<MinecraftInstallResult> {
   let installationKey: string | null = null
   let libraryCount = 0
+  let assetCount = 0
+  let nativeArchiveCount = 0
+  let extractedNativeFileCount = 0
   let downloadedFileCount = 0
 
   try {
@@ -1277,6 +2167,9 @@ async function installMinecraftVersion(
         versionId,
         jarPath: null,
         libraryCount: 0,
+        assetCount: 0,
+        nativeArchiveCount: 0,
+        extractedNativeFileCount: 0,
         downloadedFileCount: 0,
         error: 'Instalacja tej wersji już trwa.'
       }
@@ -1291,59 +2184,71 @@ async function installMinecraftVersion(
         'checking',
         0,
         0,
-        'Sprawdzanie klienta i bibliotek...',
+        'Przygotowywanie klienta, bibliotek, assetów i natives...',
         null,
         0,
         0
       )
     )
 
-    const metadata = await getMinecraftVersionMetadata(versionId)
-    const files = getDownloadFiles(metadata, safeGameDirectory)
-    const paths = getVersionPaths(safeGameDirectory, versionId)
-    libraryCount = files.filter((file) => file.kind === 'library').length
+    const plan = await getMinecraftInstallPlan(
+      versionId,
+      safeGameDirectory
+    )
 
-    await mkdir(paths.versionDirectory, {
-      recursive: true
-    })
+    libraryCount = plan.libraryFiles.length
+    assetCount = plan.assetFiles.length
+    nativeArchiveCount = plan.nativeArchives.length
 
-    await mkdir(paths.librariesDirectory, {
-      recursive: true
-    })
+    await Promise.all([
+      mkdir(plan.paths.versionDirectory, { recursive: true }),
+      mkdir(plan.paths.librariesDirectory, { recursive: true }),
+      mkdir(plan.paths.assetIndexesDirectory, { recursive: true }),
+      mkdir(plan.paths.assetObjectsDirectory, { recursive: true })
+    ])
 
     await writeFile(
-      paths.jsonPath,
-      JSON.stringify(metadata, null, 2),
+      plan.paths.jsonPath,
+      JSON.stringify(plan.metadata, null, 2),
       'utf8'
     )
 
-    const filesToDownload: DownloadFile[] = []
+    let lastCheckUpdate = 0
 
-    for (let index = 0; index < files.length; index += 1) {
-      const file = files[index]
+    const inspections = await inspectDownloadFiles(
+      plan.allFiles,
+      (file) => file.kind !== 'asset',
+      (completed, total, file) => {
+        const now = Date.now()
 
-      sendInstallProgress(
-        sender,
-        createProgress(
-          versionId,
-          'checking',
-          0,
-          0,
-          `Sprawdzanie plików ${index + 1}/${files.length}...`,
-          shortenFileLabel(file.label),
-          index,
-          files.length
+        if (now - lastCheckUpdate < 100 && completed < total) {
+          return
+        }
+
+        lastCheckUpdate = now
+
+        sendInstallProgress(
+          sender,
+          createProgress(
+            versionId,
+            'checking',
+            0,
+            0,
+            `Sprawdzanie plików ${completed}/${total}...`,
+            shortenFileLabel(file.label),
+            completed,
+            total
+          )
         )
-      )
-
-      const inspection = await inspectDownloadFile(file)
-
-      if (!inspection.valid) {
-        filesToDownload.push(file)
       }
-    }
+    )
 
-    if (filesToDownload.length === 0) {
+    const filesToDownload = plan.allFiles.filter(
+      (_file, index) => !inspections[index].valid
+    )
+    const nativeExtractionBefore = await inspectNativeExtraction(plan)
+
+    if (filesToDownload.length === 0 && nativeExtractionBefore.valid) {
       sendInstallProgress(
         sender,
         createProgress(
@@ -1351,10 +2256,10 @@ async function installMinecraftVersion(
           'complete',
           0,
           0,
-          'Klient i biblioteki są już poprawnie zainstalowane.',
+          'Wszystkie pliki gry są już poprawnie zainstalowane.',
           null,
-          files.length,
-          files.length
+          plan.allFiles.length,
+          plan.allFiles.length
         )
       )
 
@@ -1362,63 +2267,50 @@ async function installMinecraftVersion(
         success: true,
         alreadyInstalled: true,
         versionId,
-        jarPath: paths.jarPath,
+        jarPath: plan.paths.jarPath,
         libraryCount,
+        assetCount,
+        nativeArchiveCount,
+        extractedNativeFileCount:
+          nativeExtractionBefore.extractedFileCount,
         downloadedFileCount: 0,
         error: null
       }
     }
 
-    const totalBytes = filesToDownload.reduce(
+    const downloadTotalBytes = filesToDownload.reduce(
       (sum, file) => sum + file.size,
       0
     )
 
-    let completedBytes = 0
+    downloadedFileCount = await downloadFilesConcurrently(
+      sender,
+      versionId,
+      filesToDownload
+    )
 
-    for (
-      let index = 0;
-      index < filesToDownload.length;
-      index += 1
-    ) {
-      const file = filesToDownload[index]
+    const shouldExtractNatives =
+      plan.nativeArchives.length > 0 &&
+      (!nativeExtractionBefore.valid ||
+        filesToDownload.some((file) => file.kind === 'native'))
 
-      await downloadAndVerifyFile(
-        sender,
-        versionId,
-        file,
-        completedBytes,
-        totalBytes,
-        index,
-        filesToDownload.length
-      )
-
-      completedBytes += file.size
-      downloadedFileCount = index + 1
-
-      sendInstallProgress(
-        sender,
-        createProgress(
-          versionId,
-          'downloading',
-          completedBytes,
-          totalBytes,
-          `Pobrano plik ${index + 1}/${filesToDownload.length}.`,
-          shortenFileLabel(file.label),
-          index + 1,
-          filesToDownload.length
+    extractedNativeFileCount = shouldExtractNatives
+      ? await extractNativeArchives(
+          sender,
+          plan,
+          downloadTotalBytes,
+          downloadTotalBytes
         )
-      )
-    }
+      : nativeExtractionBefore.extractedFileCount
 
     sendInstallProgress(
       sender,
       createProgress(
         versionId,
         'complete',
-        totalBytes,
-        totalBytes,
-        `Zainstalowano klienta i ${libraryCount} bibliotek.`,
+        downloadTotalBytes,
+        downloadTotalBytes,
+        `Zainstalowano klienta, ${libraryCount} bibliotek, ${assetCount} assetów i pliki native.`,
         null,
         filesToDownload.length,
         filesToDownload.length
@@ -1429,8 +2321,11 @@ async function installMinecraftVersion(
       success: true,
       alreadyInstalled: false,
       versionId,
-      jarPath: paths.jarPath,
+      jarPath: plan.paths.jarPath,
       libraryCount,
+      assetCount,
+      nativeArchiveCount,
+      extractedNativeFileCount,
       downloadedFileCount,
       error: null
     }
@@ -1457,6 +2352,9 @@ async function installMinecraftVersion(
       versionId,
       jarPath: null,
       libraryCount,
+      assetCount,
+      nativeArchiveCount,
+      extractedNativeFileCount,
       downloadedFileCount,
       error: message
     }
@@ -1608,6 +2506,17 @@ app.whenReady().then(() => {
           validLibraryCount: 0,
           missingLibraryCount: 0,
           invalidLibraryCount: 0,
+          assetIndexValid: false,
+          assetCount: 0,
+          validAssetCount: 0,
+          missingAssetCount: 0,
+          invalidAssetCount: 0,
+          nativeArchiveCount: 0,
+          validNativeArchiveCount: 0,
+          missingNativeArchiveCount: 0,
+          invalidNativeArchiveCount: 0,
+          nativesExtracted: false,
+          nativeFileCount: 0,
           totalExpectedSize: null,
           error: 'Nieprawidłowe dane sprawdzania instalacji.'
         } satisfies MinecraftInstallStatus
@@ -1630,6 +2539,9 @@ app.whenReady().then(() => {
           versionId: '',
           jarPath: null,
           libraryCount: 0,
+          assetCount: 0,
+          nativeArchiveCount: 0,
+          extractedNativeFileCount: 0,
           downloadedFileCount: 0,
           error: 'Nieprawidłowe dane instalacji.'
         } satisfies MinecraftInstallResult

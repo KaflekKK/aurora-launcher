@@ -48,6 +48,7 @@ type InstallPhase =
   | 'checking'
   | 'downloading'
   | 'verifying'
+  | 'extracting'
   | 'complete'
   | 'error'
 
@@ -73,10 +74,25 @@ interface MinecraftInstallStatus {
   currentSha1: string | null
   expectedSha1: string | null
   clientValid: boolean
+
   libraryCount: number
   validLibraryCount: number
   missingLibraryCount: number
   invalidLibraryCount: number
+
+  assetIndexValid: boolean
+  assetCount: number
+  validAssetCount: number
+  missingAssetCount: number
+  invalidAssetCount: number
+
+  nativeArchiveCount: number
+  validNativeArchiveCount: number
+  missingNativeArchiveCount: number
+  invalidNativeArchiveCount: number
+  nativesExtracted: boolean
+  nativeFileCount: number
+
   totalExpectedSize: number | null
   error: string | null
 }
@@ -87,6 +103,9 @@ interface MinecraftInstallResult {
   versionId: string
   jarPath: string | null
   libraryCount: number
+  assetCount: number
+  nativeArchiveCount: number
+  extractedNativeFileCount: number
   downloadedFileCount: number
   error: string | null
 }
