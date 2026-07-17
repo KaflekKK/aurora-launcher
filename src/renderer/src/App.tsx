@@ -7,6 +7,8 @@ import {
 
 type Page = 'home' | 'profiles' | 'settings'
 type MinecraftVersion = '1.21.11' | '1.21.4' | '1.20.1'
+type GameProfile = 'aurora' | 'vanilla'
+type AccountType = 'local' | 'microsoft'
 
 type InstallPhase =
   | 'checking'
@@ -15,7 +17,16 @@ type InstallPhase =
   | 'complete'
   | 'error'
 
+interface LauncherAccount {
+  id: string
+  type: AccountType
+  username: string
+}
+
 interface LauncherSettings {
+  selectedProfile: GameProfile
+  accounts: LauncherAccount[]
+  selectedAccountId: string | null
   minecraftVersion: MinecraftVersion
   ram: number
   gameDirectory: string
@@ -73,6 +84,9 @@ interface MinecraftInstallProgress {
   totalBytes: number
   percent: number
   message: string
+  currentFile: string | null
+  completedFiles: number
+  totalFiles: number
 }
 
 interface MinecraftInstallStatus {
@@ -84,6 +98,12 @@ interface MinecraftInstallStatus {
   expectedSize: number | null
   currentSha1: string | null
   expectedSha1: string | null
+  clientValid: boolean
+  libraryCount: number
+  validLibraryCount: number
+  missingLibraryCount: number
+  invalidLibraryCount: number
+  totalExpectedSize: number | null
   error: string | null
 }
 
@@ -95,6 +115,9 @@ interface DetailItemProps {
 const SETTINGS_KEY = 'aurora-launcher-settings'
 
 const DEFAULT_SETTINGS: LauncherSettings = {
+  selectedProfile: 'aurora',
+  accounts: [],
+  selectedAccountId: null,
   minecraftVersion: '1.21.11',
   ram: 4,
   gameDirectory: '',
@@ -110,6 +133,30 @@ function isMinecraftVersion(value: unknown): value is MinecraftVersion {
   )
 }
 
+function isGameProfile(value: unknown): value is GameProfile {
+  return value === 'aurora' || value === 'vanilla'
+}
+
+function isLauncherAccount(value: unknown): value is LauncherAccount {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const account = value as Partial<LauncherAccount>
+
+  return (
+    typeof account.id === 'string' &&
+    account.id.length > 0 &&
+    (account.type === 'local' || account.type === 'microsoft') &&
+    typeof account.username === 'string' &&
+    account.username.length > 0
+  )
+}
+
+function createAccountId(): string {
+  return `local-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
 function loadSettings(): LauncherSettings {
   try {
     const savedSettings = window.localStorage.getItem(SETTINGS_KEY)
@@ -122,7 +169,24 @@ function loadSettings(): LauncherSettings {
       savedSettings
     ) as Partial<LauncherSettings>
 
+    const accounts = Array.isArray(parsed.accounts)
+      ? parsed.accounts.filter(isLauncherAccount)
+      : DEFAULT_SETTINGS.accounts
+
+    const selectedAccountId =
+      typeof parsed.selectedAccountId === 'string' &&
+      accounts.some((account) => account.id === parsed.selectedAccountId)
+        ? parsed.selectedAccountId
+        : accounts[0]?.id ?? null
+
     return {
+      selectedProfile: isGameProfile(parsed.selectedProfile)
+        ? parsed.selectedProfile
+        : DEFAULT_SETTINGS.selectedProfile,
+
+      accounts,
+      selectedAccountId,
+
       minecraftVersion: isMinecraftVersion(parsed.minecraftVersion)
         ? parsed.minecraftVersion
         : DEFAULT_SETTINGS.minecraftVersion,
@@ -240,6 +304,18 @@ function App(): React.JSX.Element {
   const [initialSettings] = useState<LauncherSettings>(() => loadSettings())
 
   const [page, setPage] = useState<Page>('home')
+  const [selectedProfile, setSelectedProfile] = useState<GameProfile>(
+    initialSettings.selectedProfile
+  )
+  const [accounts, setAccounts] = useState<LauncherAccount[]>(
+    initialSettings.accounts
+  )
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(
+    initialSettings.selectedAccountId
+  )
+  const [accountPanelOpen, setAccountPanelOpen] = useState(false)
+  const [newNickname, setNewNickname] = useState('')
+  const [accountError, setAccountError] = useState<string | null>(null)
   const [minecraftVersion, setMinecraftVersion] =
     useState<MinecraftVersion>(initialSettings.minecraftVersion)
   const [ram, setRam] = useState(initialSettings.ram)
@@ -386,7 +462,13 @@ function App(): React.JSX.Element {
           expectedSize: null,
           currentSha1: null,
           expectedSha1: null,
-          error: 'Nie udało się sprawdzić pliku klienta.'
+          clientValid: false,
+          libraryCount: 0,
+          validLibraryCount: 0,
+          missingLibraryCount: 0,
+          invalidLibraryCount: 0,
+          totalExpectedSize: null,
+          error: 'Nie udało się sprawdzić klienta i bibliotek.'
         })
       } finally {
         if (requestId === installStatusRequestId.current) {
@@ -433,6 +515,114 @@ function App(): React.JSX.Element {
     }
   }, [minecraftVersion])
 
+  function persistSettings(
+    overrides: Partial<LauncherSettings> = {}
+  ): boolean {
+    const settings: LauncherSettings = {
+      selectedProfile,
+      accounts,
+      selectedAccountId,
+      minecraftVersion,
+      ram,
+      gameDirectory,
+      minimizeOnLaunch,
+      closeOnLaunch,
+      ...overrides
+    }
+
+    try {
+      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
+      return true
+    } catch (error) {
+      console.error('Nie udało się zapisać ustawień:', error)
+      return false
+    }
+  }
+
+  function openAccountPanel(): void {
+    setAccountError(null)
+    setAccountPanelOpen(true)
+  }
+
+  function addLocalAccount(): void {
+    const username = newNickname.trim()
+
+    if (!/^[A-Za-z0-9_]{3,16}$/.test(username)) {
+      setAccountError(
+        'Nick musi mieć od 3 do 16 znaków i może zawierać litery, cyfry oraz znak _.'
+      )
+      return
+    }
+
+    if (
+      accounts.some(
+        (account) => account.username.toLowerCase() === username.toLowerCase()
+      )
+    ) {
+      setAccountError('Profil z takim nickiem już istnieje.')
+      return
+    }
+
+    const account: LauncherAccount = {
+      id: createAccountId(),
+      type: 'local',
+      username
+    }
+
+    const updatedAccounts = [...accounts, account]
+
+    setAccounts(updatedAccounts)
+    setSelectedAccountId(account.id)
+    setNewNickname('')
+    setAccountError(null)
+    persistSettings({
+      accounts: updatedAccounts,
+      selectedAccountId: account.id
+    })
+  }
+
+  function selectAccount(accountId: string): void {
+    setSelectedAccountId(accountId)
+    setAccountError(null)
+    persistSettings({ selectedAccountId: accountId })
+  }
+
+  function deleteAccount(accountId: string): void {
+    const account = accounts.find((item) => item.id === accountId)
+
+    if (!account || account.type !== 'local') {
+      return
+    }
+
+    const shouldDelete = window.confirm(
+      `Usunąć lokalny profil gracza ${account.username}?`
+    )
+
+    if (!shouldDelete) {
+      return
+    }
+
+    const updatedAccounts = accounts.filter((item) => item.id !== accountId)
+    const nextSelectedAccountId =
+      selectedAccountId === accountId
+        ? updatedAccounts[0]?.id ?? null
+        : selectedAccountId
+
+    setAccounts(updatedAccounts)
+    setSelectedAccountId(nextSelectedAccountId)
+    persistSettings({
+      accounts: updatedAccounts,
+      selectedAccountId: nextSelectedAccountId
+    })
+  }
+
+  function showMicrosoftLoginInfo(): void {
+    alert(
+      'Dodawanie konta Microsoft będzie następnym etapem.\n\n' +
+        'Logowanie otworzy oficjalną stronę Microsoft w przeglądarce. Aurora nie będzie prosić o hasło.'
+    )
+  }
+
   async function chooseGameDirectory(): Promise<void> {
     setFolderChoosing(true)
 
@@ -452,7 +642,7 @@ function App(): React.JSX.Element {
     }
   }
 
-  async function installMinecraftClient(): Promise<void> {
+  async function installMinecraftVersion(): Promise<void> {
     if (!gameDirectory) {
       alert('Najpierw wybierz folder gry w ustawieniach.')
       setPage('settings')
@@ -469,13 +659,16 @@ function App(): React.JSX.Element {
       versionId: minecraftVersion,
       phase: 'checking',
       downloadedBytes: 0,
-      totalBytes: versionDetails.clientSize ?? 0,
+      totalBytes: 0,
       percent: 0,
-      message: 'Przygotowywanie instalacji...'
+      message: 'Przygotowywanie instalacji...',
+      currentFile: null,
+      completedFiles: 0,
+      totalFiles: 0
     })
 
     try {
-      const result = await window.api.installMinecraftClient(
+      const result = await window.api.installMinecraftVersion(
         minecraftVersion,
         gameDirectory
       )
@@ -492,45 +685,53 @@ function App(): React.JSX.Element {
 
       alert(
         result.alreadyInstalled
-          ? `Minecraft ${minecraftVersion} jest już poprawnie zainstalowany.`
-          : `Pobrano i sprawdzono plik klienta Minecraft ${minecraftVersion}.\n\n` +
-              `Plik: ${result.jarPath ?? 'brak ścieżki'}`
+          ? `Minecraft ${minecraftVersion} oraz biblioteki są już poprawnie zainstalowane.`
+          : `Pobrano i sprawdzono pliki Minecraft ${minecraftVersion}.\n\n` +
+              `Klient: ${result.jarPath ?? 'brak ścieżki'}\n` +
+              `Biblioteki: ${result.libraryCount}\n` +
+              `Pobrane pliki: ${result.downloadedFileCount}`
       )
     } catch (error) {
-      console.error('Nie udało się zainstalować klienta:', error)
-      alert('Nie udało się rozpocząć instalacji klienta.')
+      console.error('Nie udało się zainstalować plików gry:', error)
+      alert('Nie udało się rozpocząć instalacji plików gry.')
     } finally {
       setInstalling(false)
     }
   }
 
   function saveSettings(): void {
-    const settings: LauncherSettings = {
-      minecraftVersion,
-      ram,
-      gameDirectory,
-      minimizeOnLaunch,
-      closeOnLaunch
-    }
-
-    try {
-      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
-
-      alert(
-        `Ustawienia zapisane.\n\n` +
-          `Wersja: Minecraft ${minecraftVersion}\n` +
-          `RAM: ${ram} GB\n` +
-          `Folder: ${gameDirectory}`
-      )
-    } catch (error) {
-      console.error('Nie udało się zapisać ustawień:', error)
+    if (!persistSettings()) {
       alert('Nie udało się zapisać ustawień.')
+      return
     }
+
+    const selectedAccount = accounts.find(
+      (account) => account.id === selectedAccountId
+    )
+
+    alert(
+      `Ustawienia zapisane.\n\n` +
+        `Profil gry: ${selectedProfile === 'vanilla' ? 'Vanilla' : 'Aurora Client'}\n` +
+        `Gracz: ${selectedAccount?.username ?? 'nie wybrano'}\n` +
+        `Wersja: Minecraft ${minecraftVersion}\n` +
+        `RAM: ${ram} GB\n` +
+        `Folder: ${gameDirectory}`
+    )
   }
 
   function playMinecraft(): void {
+    const selectedAccount = accounts.find(
+      (account) => account.id === selectedAccountId
+    )
+
+    if (!selectedAccount) {
+      alert('Najpierw wybierz lub dodaj profil gracza.')
+      openAccountPanel()
+      return
+    }
+
     if (!installStatus?.valid) {
-      void installMinecraftClient()
+      void installMinecraftVersion()
       return
     }
 
@@ -541,13 +742,23 @@ function App(): React.JSX.Element {
     }
 
     alert(
-      `Aurora Client\n` +
+      `${selectedProfile === 'vanilla' ? 'Vanilla' : 'Aurora Client'}\n` +
+        `Gracz: ${selectedAccount.username} (${
+          selectedAccount.type === 'local' ? 'profil lokalny' : 'Microsoft'
+        })\n` +
         `Minecraft ${minecraftVersion}\n` +
         `RAM: ${ram} GB\n` +
         `Java: ${javaInfo.version ?? 'nieznana'}\n` +
-        `Plik klienta: poprawny\n\n` +
-        `Biblioteki, assety, logowanie i prawdziwe uruchamianie dodamy w kolejnych etapach.`
+        `Plik klienta: poprawny\n` +
+        `Biblioteki: ${installStatus.validLibraryCount}/${installStatus.libraryCount}\n\n` +
+        `Assety, pliki native i prawdziwe uruchamianie dodamy w kolejnych etapach.`
     )
+  }
+
+  function selectProfile(profile: GameProfile): void {
+    setSelectedProfile(profile)
+
+    persistSettings({ selectedProfile: profile })
   }
 
   function getJavaDescription(): string {
@@ -591,19 +802,22 @@ function App(): React.JSX.Element {
     }
 
     if (installStatusLoading) {
-      return 'Sprawdzanie pliku klienta...'
+      return 'Sprawdzanie klienta i bibliotek...'
     }
 
     if (installStatus?.valid) {
-      return `Zainstalowana · ${formatBytes(installStatus.currentSize)}`
-    }
-
-    if (installStatus?.installed) {
-      return installStatus.error ?? 'Plik klienta wymaga naprawy.'
+      return (
+        `Zainstalowana · klient + ` +
+        `${installStatus.validLibraryCount}/${installStatus.libraryCount} bibliotek`
+      )
     }
 
     if (installStatus?.error) {
       return installStatus.error
+    }
+
+    if (installStatus && installStatus.missingLibraryCount > 0) {
+      return `Brakuje bibliotek: ${installStatus.missingLibraryCount}`
     }
 
     return 'Wymaga instalacji'
@@ -614,7 +828,7 @@ function App(): React.JSX.Element {
     versionInfo?.available === true &&
     versionDetails?.available === true
 
-  const clientInstalled = installStatus?.valid === true
+  const baseFilesInstalled = installStatus?.valid === true
 
   const mainActionDisabled =
     installing ||
@@ -625,19 +839,36 @@ function App(): React.JSX.Element {
 
   const mainActionText = installing
     ? `${installProgress?.percent ?? 0}%`
-    : clientInstalled
+    : baseFilesInstalled
       ? 'GRAJ'
       : 'ZAINSTALUJ'
 
   const topStatusText = installing
-    ? 'Instalowanie klienta'
+    ? 'Instalowanie plików gry'
     : minecraftLoading
       ? 'Pobieranie danych wersji'
       : installStatusLoading
         ? 'Sprawdzanie instalacji'
-        : clientInstalled
+        : baseFilesInstalled
           ? 'Launcher gotowy'
           : 'Wymaga instalacji'
+
+  const selectedProfileName =
+    selectedProfile === 'vanilla' ? 'Vanilla' : 'Aurora Client'
+
+  const selectedProfileLogo = selectedProfile === 'vanilla' ? 'V' : 'A'
+
+  const selectedProfileDescription =
+    selectedProfile === 'vanilla'
+      ? 'Czysty Minecraft Java Edition'
+      : 'Minecraft Java Edition'
+
+  const selectedAccount = accounts.find(
+    (account) => account.id === selectedAccountId
+  )
+
+  const selectedAccountInitial =
+    selectedAccount?.username.charAt(0).toUpperCase() ?? '?'
 
   return (
     <div className="launcher">
@@ -687,16 +918,35 @@ function App(): React.JSX.Element {
         </nav>
 
         <div className="sidebar-bottom">
-          <div className="account">
-            <div className="avatar">?</div>
+          <button
+            type="button"
+            className="account"
+            onClick={openAccountPanel}
+            style={{
+              width: '100%',
+              padding: 0,
+              color: 'inherit',
+              textAlign: 'left',
+              background: 'transparent',
+              border: 0,
+              cursor: 'pointer'
+            }}
+          >
+            <div className="avatar">{selectedAccountInitial}</div>
 
             <div className="account-text">
-              <strong>Nie zalogowano</strong>
-              <span>Konto Microsoft</span>
+              <strong>{selectedAccount?.username ?? 'Wybierz gracza'}</strong>
+              <span>
+                {selectedAccount
+                  ? selectedAccount.type === 'local'
+                    ? 'Profil lokalny'
+                    : 'Konto Microsoft'
+                  : 'Kliknij, aby dodać nick'}
+              </span>
             </div>
-          </div>
+          </button>
 
-          <span className="app-version">Aurora Launcher v0.7.0</span>
+          <span className="app-version">Aurora Launcher v0.9.0</span>
         </div>
       </aside>
 
@@ -710,9 +960,9 @@ function App(): React.JSX.Element {
           <button
             type="button"
             className="login-button"
-            onClick={() => alert('Logowanie Microsoft dodamy później.')}
+            onClick={openAccountPanel}
           >
-            Zaloguj się
+            {selectedAccount?.username ?? 'Wybierz gracza'}
           </button>
         </header>
 
@@ -742,8 +992,8 @@ function App(): React.JSX.Element {
                 </div>
 
                 <div className="feature">
-                  <strong>Bezpieczny</strong>
-                  <span>Logowanie przez Microsoft</span>
+                  <strong>Elastyczny</strong>
+                  <span>Profil lokalny lub Microsoft</span>
                 </div>
 
                 <div className="feature">
@@ -755,12 +1005,12 @@ function App(): React.JSX.Element {
 
             <div className="play-panel">
               <div className="selected-profile">
-                <div className="profile-logo">A</div>
+                <div className="profile-logo">{selectedProfileLogo}</div>
 
                 <div>
                   <span className="small-label">WYBRANY PROFIL</span>
-                  <h2>Aurora Client</h2>
-                  <p>Minecraft Java Edition</p>
+                  <h2>{selectedProfileName}</h2>
+                  <p>{selectedProfileDescription}</p>
                 </div>
               </div>
 
@@ -784,7 +1034,7 @@ function App(): React.JSX.Element {
 
                 <span
                   style={{
-                    color: clientInstalled ? '#c084fc' : '#a89bad',
+                    color: baseFilesInstalled ? '#c084fc' : '#a89bad',
                     fontSize: '9px',
                     lineHeight: 1.35
                   }}
@@ -797,13 +1047,13 @@ function App(): React.JSX.Element {
                 type="button"
                 className="play-button"
                 disabled={mainActionDisabled}
-                onClick={clientInstalled ? playMinecraft : () => void installMinecraftClient()}
+                onClick={baseFilesInstalled ? playMinecraft : () => void installMinecraftVersion()}
                 style={{
                   opacity: mainActionDisabled ? 0.5 : 1,
                   cursor: mainActionDisabled ? 'not-allowed' : 'pointer'
                 }}
               >
-                <span>{clientInstalled ? '▶' : '↓'}</span>
+                <span>{baseFilesInstalled ? '▶' : '↓'}</span>
                 {mainActionText}
               </button>
 
@@ -832,12 +1082,14 @@ function App(): React.JSX.Element {
                     </span>
 
                     <span>
+                      {installProgress?.totalFiles
+                        ? `Plik ${Math.min(
+                            installProgress.completedFiles + 1,
+                            installProgress.totalFiles
+                          )}/${installProgress.totalFiles} · `
+                        : ''}
                       {formatBytes(installProgress?.downloadedBytes ?? 0)} /{' '}
-                      {formatBytes(
-                        installProgress?.totalBytes ??
-                          versionDetails?.clientSize ??
-                          null
-                      )}
+                      {formatBytes(installProgress?.totalBytes ?? null)}
                     </span>
                   </div>
 
@@ -886,24 +1138,40 @@ function App(): React.JSX.Element {
             </div>
 
             <div className="profiles">
-              <article className="profile-card selected-card">
+              <article
+                className={
+                  selectedProfile === 'aurora'
+                    ? 'profile-card selected-card'
+                    : 'profile-card'
+                }
+              >
                 <div className="card-logo">A</div>
 
                 <div className="card-text">
                   <h2>Aurora Client</h2>
-                  <p>Minecraft {minecraftVersion} · Profil domyślny</p>
+                  <p>Minecraft {minecraftVersion} · Profil Aurora</p>
                 </div>
 
-                <span className="active-badge">
-                  {installing
-                    ? `${installProgress?.percent ?? 0}%`
-                    : clientInstalled
-                      ? 'ZAINSTALOWANY'
-                      : 'DO INSTALACJI'}
-                </span>
+                {selectedProfile === 'aurora' ? (
+                  <span className="active-badge">AKTYWNY</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="small-button"
+                    onClick={() => selectProfile('aurora')}
+                  >
+                    Wybierz
+                  </button>
+                )}
               </article>
 
-              <article className="profile-card">
+              <article
+                className={
+                  selectedProfile === 'vanilla'
+                    ? 'profile-card selected-card'
+                    : 'profile-card'
+                }
+              >
                 <div className="card-logo dark-logo">V</div>
 
                 <div className="card-text">
@@ -911,13 +1179,17 @@ function App(): React.JSX.Element {
                   <p>Czysty Minecraft bez dodatkowych modyfikacji</p>
                 </div>
 
-                <button
-                  type="button"
-                  className="small-button"
-                  onClick={() => alert('Wybrano profil Vanilla.')}
-                >
-                  Wybierz
-                </button>
+                {selectedProfile === 'vanilla' ? (
+                  <span className="active-badge">AKTYWNY</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="small-button"
+                    onClick={() => selectProfile('vanilla')}
+                  >
+                    Wybierz
+                  </button>
+                )}
               </article>
 
               <article className="profile-card unavailable">
@@ -948,9 +1220,9 @@ function App(): React.JSX.Element {
               <article className="settings-card">
                 <div className="setting-top">
                   <div>
-                    <h2>Instalacja klienta</h2>
+                    <h2>Instalacja gry</h2>
                     <p>
-                      Oficjalny plik klienta wybranej wersji Minecrafta.
+                      Oficjalny klient oraz biblioteki wybranej wersji Minecrafta.
                     </p>
                   </div>
 
@@ -959,7 +1231,7 @@ function App(): React.JSX.Element {
                       ? `${installProgress?.percent ?? 0}%`
                       : installStatusLoading
                         ? '...'
-                        : clientInstalled
+                        : baseFilesInstalled
                           ? 'Gotowa'
                           : 'Brak'}
                   </strong>
@@ -974,11 +1246,11 @@ function App(): React.JSX.Element {
                     type="button"
                     className="small-button"
                     disabled={installing || !versionReady || !gameDirectory}
-                    onClick={() => void installMinecraftClient()}
+                    onClick={() => void installMinecraftVersion()}
                   >
                     {installing
                       ? 'Instalowanie...'
-                      : clientInstalled
+                      : baseFilesInstalled
                         ? 'Sprawdź / napraw'
                         : 'Zainstaluj'}
                   </button>
@@ -989,6 +1261,30 @@ function App(): React.JSX.Element {
                     <code title={installStatus.jarPath}>
                       {installStatus.jarPath}
                     </code>
+                  </div>
+                )}
+
+                {installStatus && (
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                      gap: '10px',
+                      marginTop: '14px'
+                    }}
+                  >
+                    <DetailItem
+                      label="Poprawne biblioteki"
+                      value={`${installStatus.validLibraryCount}/${installStatus.libraryCount}`}
+                    />
+                    <DetailItem
+                      label="Brakujące"
+                      value={`${installStatus.missingLibraryCount}`}
+                    />
+                    <DetailItem
+                      label="Uszkodzone"
+                      value={`${installStatus.invalidLibraryCount}`}
+                    />
                   </div>
                 )}
 
@@ -1285,6 +1581,259 @@ function App(): React.JSX.Element {
           </section>
         )}
       </main>
+
+      {accountPanelOpen && (
+        <div
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setAccountPanelOpen(false)
+            }
+          }}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 1000,
+            display: 'grid',
+            placeItems: 'center',
+            padding: '24px',
+            background: 'rgba(3, 2, 5, 0.78)',
+            backdropFilter: 'blur(12px)'
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="account-dialog-title"
+            style={{
+              width: 'min(520px, 100%)',
+              maxHeight: 'calc(100vh - 48px)',
+              overflowY: 'auto',
+              padding: '24px',
+              background:
+                'linear-gradient(145deg, rgba(27, 18, 34, 0.98), rgba(10, 8, 13, 0.98))',
+              border: '1px solid rgba(192, 132, 252, 0.22)',
+              borderRadius: '18px',
+              boxShadow: '0 24px 80px rgba(0, 0, 0, 0.58)'
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+                gap: '16px',
+                marginBottom: '20px'
+              }}
+            >
+              <div>
+                <span className="small-label">PROFILE GRACZA</span>
+                <h2
+                  id="account-dialog-title"
+                  style={{ margin: '6px 0 5px', color: '#f3edf6' }}
+                >
+                  Wybierz nick
+                </h2>
+                <p
+                  style={{
+                    margin: 0,
+                    color: '#8d8195',
+                    fontSize: '11px',
+                    lineHeight: 1.55
+                  }}
+                >
+                  Profil lokalny zapisuje nick tylko na tym komputerze. Konto
+                  Microsoft będzie można dodać opcjonalnie.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                className="small-button"
+                onClick={() => setAccountPanelOpen(false)}
+                aria-label="Zamknij wybór gracza"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div style={{ display: 'grid', gap: '9px', marginBottom: '18px' }}>
+              {accounts.length === 0 ? (
+                <div
+                  style={{
+                    padding: '17px',
+                    color: '#8d8195',
+                    fontSize: '11px',
+                    textAlign: 'center',
+                    background: 'rgba(5, 4, 7, 0.42)',
+                    border: '1px dashed rgba(192, 132, 252, 0.2)',
+                    borderRadius: '12px'
+                  }}
+                >
+                  Nie masz jeszcze żadnego profilu gracza.
+                </div>
+              ) : (
+                accounts.map((account) => {
+                  const isSelected = account.id === selectedAccountId
+
+                  return (
+                    <div
+                      key={account.id}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '42px minmax(0, 1fr) auto',
+                        alignItems: 'center',
+                        gap: '12px',
+                        padding: '11px',
+                        background: isSelected
+                          ? 'rgba(126, 34, 206, 0.2)'
+                          : 'rgba(5, 4, 7, 0.42)',
+                        border: isSelected
+                          ? '1px solid rgba(192, 132, 252, 0.38)'
+                          : '1px solid rgba(192, 132, 252, 0.1)',
+                        borderRadius: '12px'
+                      }}
+                    >
+                      <div
+                        className="avatar"
+                        style={{ width: '42px', height: '42px' }}
+                      >
+                        {account.username.charAt(0).toUpperCase()}
+                      </div>
+
+                      <div style={{ minWidth: 0 }}>
+                        <strong
+                          style={{
+                            display: 'block',
+                            overflow: 'hidden',
+                            color: '#eee7f2',
+                            fontSize: '12px',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap'
+                          }}
+                        >
+                          {account.username}
+                        </strong>
+                        <span style={{ color: '#756a7c', fontSize: '9px' }}>
+                          {account.type === 'local'
+                            ? 'Profil lokalny'
+                            : 'Konto Microsoft'}
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '7px' }}>
+                        {isSelected ? (
+                          <span className="active-badge">AKTYWNY</span>
+                        ) : (
+                          <button
+                            type="button"
+                            className="small-button"
+                            onClick={() => selectAccount(account.id)}
+                          >
+                            Wybierz
+                          </button>
+                        )}
+
+                        {account.type === 'local' && (
+                          <button
+                            type="button"
+                            className="small-button"
+                            onClick={() => deleteAccount(account.id)}
+                            title="Usuń profil lokalny"
+                          >
+                            Usuń
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })
+              )}
+            </div>
+
+            <div
+              style={{
+                padding: '16px',
+                background: 'rgba(5, 4, 7, 0.42)',
+                border: '1px solid rgba(192, 132, 252, 0.1)',
+                borderRadius: '12px'
+              }}
+            >
+              <label
+                htmlFor="local-nickname"
+                style={{
+                  display: 'block',
+                  marginBottom: '8px',
+                  color: '#b9aec0',
+                  fontSize: '10px',
+                  fontWeight: 700
+                }}
+              >
+                Dodaj profil lokalny
+              </label>
+
+              <div style={{ display: 'flex', gap: '9px' }}>
+                <input
+                  id="local-nickname"
+                  value={newNickname}
+                  maxLength={16}
+                  autoFocus
+                  placeholder="Wpisz nick, np. Kaflek"
+                  onChange={(event) => {
+                    setNewNickname(event.target.value)
+                    setAccountError(null)
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      addLocalAccount()
+                    }
+                  }}
+                  style={{
+                    minWidth: 0,
+                    flex: 1,
+                    padding: '11px 12px',
+                    color: '#f1eaf4',
+                    background: '#0b090e',
+                    border: '1px solid rgba(192, 132, 252, 0.2)',
+                    borderRadius: '9px',
+                    outline: 'none'
+                  }}
+                />
+
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={addLocalAccount}
+                >
+                  Dodaj
+                </button>
+              </div>
+
+              {accountError && (
+                <p
+                  style={{
+                    margin: '9px 0 0',
+                    color: '#ff8faf',
+                    fontSize: '9px',
+                    lineHeight: 1.45
+                  }}
+                >
+                  {accountError}
+                </p>
+              )}
+            </div>
+
+            <button
+              type="button"
+              className="save-button"
+              onClick={showMicrosoftLoginInfo}
+              style={{ width: '100%', marginTop: '12px' }}
+            >
+              + Dodaj konto Microsoft
+            </button>
+          </section>
+        </div>
+      )}
     </div>
   )
 }

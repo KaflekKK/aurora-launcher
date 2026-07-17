@@ -11,6 +11,7 @@ import {
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createReadStream, existsSync } from 'node:fs'
+import { release as getOsRelease } from 'node:os'
 import {
   mkdir,
   open,
@@ -19,7 +20,7 @@ import {
   stat,
   writeFile
 } from 'node:fs/promises'
-import { isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -80,6 +81,31 @@ interface MinecraftAssetIndex {
   url: string
 }
 
+interface MinecraftLibraryArtifact {
+  path: string
+  sha1: string
+  size: number
+  url: string
+}
+
+interface MinecraftLibraryRule {
+  action: 'allow' | 'disallow'
+  os?: {
+    name?: string
+    arch?: string
+    version?: string
+  }
+  features?: Record<string, boolean>
+}
+
+interface MinecraftLibrary {
+  name: string
+  downloads?: {
+    artifact?: MinecraftLibraryArtifact
+  }
+  rules?: MinecraftLibraryRule[]
+}
+
 interface MinecraftVersionMetadata {
   id: string
   type: string
@@ -99,7 +125,7 @@ interface MinecraftVersionMetadata {
   }
 
   assetIndex?: MinecraftAssetIndex
-  libraries?: unknown[]
+  libraries?: MinecraftLibrary[]
 
   arguments?: {
     game?: unknown[]
@@ -160,6 +186,9 @@ interface MinecraftInstallProgress {
   totalBytes: number
   percent: number
   message: string
+  currentFile: string | null
+  completedFiles: number
+  totalFiles: number
 }
 
 interface MinecraftInstallStatus {
@@ -171,6 +200,12 @@ interface MinecraftInstallStatus {
   expectedSize: number | null
   currentSha1: string | null
   expectedSha1: string | null
+  clientValid: boolean
+  libraryCount: number
+  validLibraryCount: number
+  missingLibraryCount: number
+  invalidLibraryCount: number
+  totalExpectedSize: number | null
   error: string | null
 }
 
@@ -179,6 +214,8 @@ interface MinecraftInstallResult {
   alreadyInstalled: boolean
   versionId: string
   jarPath: string | null
+  libraryCount: number
+  downloadedFileCount: number
   error: string | null
 }
 
@@ -188,6 +225,18 @@ interface FileInspection {
   size: number | null
   sha1: string | null
   error: string | null
+}
+
+type DownloadFileKind = 'client' | 'library'
+
+interface DownloadFile {
+  kind: DownloadFileKind
+  label: string
+  url: string
+  sha1: string
+  size: number
+  targetPath: string
+  temporaryPath: string
 }
 
 interface CacheEntry<T> {
@@ -603,6 +652,122 @@ async function getMinecraftVersionDetails(
   }
 }
 
+
+function getMinecraftOsName(): 'windows' | 'osx' | 'linux' {
+  if (process.platform === 'win32') {
+    return 'windows'
+  }
+
+  if (process.platform === 'darwin') {
+    return 'osx'
+  }
+
+  return 'linux'
+}
+
+function getMinecraftArchitecture(): string {
+  if (process.arch === 'ia32') {
+    return 'x86'
+  }
+
+  if (process.arch === 'x64') {
+    return 'x86_64'
+  }
+
+  return process.arch
+}
+
+function matchesRule(rule: MinecraftLibraryRule): boolean {
+  if (rule.os?.name && rule.os.name !== getMinecraftOsName()) {
+    return false
+  }
+
+  if (rule.os?.arch && rule.os.arch !== getMinecraftArchitecture()) {
+    return false
+  }
+
+  if (rule.os?.version) {
+    try {
+      if (!new RegExp(rule.os.version).test(getOsRelease())) {
+        return false
+      }
+    } catch {
+      return false
+    }
+  }
+
+  if (rule.features) {
+    for (const expectedValue of Object.values(rule.features)) {
+      if (expectedValue !== false) {
+        return false
+      }
+    }
+  }
+
+  return true
+}
+
+function isLibraryAllowed(library: MinecraftLibrary): boolean {
+  if (!library.rules || library.rules.length === 0) {
+    return true
+  }
+
+  let allowed = false
+
+  for (const rule of library.rules) {
+    if (matchesRule(rule)) {
+      allowed = rule.action === 'allow'
+    }
+  }
+
+  return allowed
+}
+
+function validateDownloadProperties(
+  label: string,
+  url: string,
+  sha1: string,
+  size: number
+): void {
+  getTrustedMinecraftUrl(url)
+
+  if (!/^[a-f0-9]{40}$/i.test(sha1)) {
+    throw new Error(`${label} ma nieprawidłową sumę SHA-1.`)
+  }
+
+  if (!Number.isSafeInteger(size) || size <= 0) {
+    throw new Error(`${label} ma nieprawidłowy rozmiar.`)
+  }
+}
+
+function resolveSafeLibraryPath(
+  librariesDirectory: string,
+  artifactPath: string
+): string {
+  const normalizedPath = artifactPath.replace(/\\/g, '/')
+
+  if (!normalizedPath || normalizedPath.includes('\u0000')) {
+    throw new Error('Biblioteka ma nieprawidłową ścieżkę.')
+  }
+
+  const targetPath = resolve(
+    librariesDirectory,
+    ...normalizedPath.split('/').filter(Boolean)
+  )
+
+  const relativePath = relative(librariesDirectory, targetPath)
+
+  if (
+    !relativePath ||
+    relativePath.startsWith('..') ||
+    isAbsolute(relativePath)
+  ) {
+    throw new Error('Biblioteka wskazuje ścieżkę poza folderem gry.')
+  }
+
+  return targetPath
+}
+
 function validateGameDirectory(gameDirectory: string): string {
   const trimmedDirectory = gameDirectory.trim()
 
@@ -618,6 +783,7 @@ function getVersionPaths(
   versionId: string
 ): {
   versionDirectory: string
+  librariesDirectory: string
   jarPath: string
   jsonPath: string
   temporaryPath: string
@@ -637,10 +803,90 @@ function getVersionPaths(
 
   return {
     versionDirectory,
+    librariesDirectory: join(safeGameDirectory, 'libraries'),
     jarPath: join(versionDirectory, `${versionId}.jar`),
     jsonPath: join(versionDirectory, `${versionId}.json`),
     temporaryPath: join(versionDirectory, `${versionId}.jar.part`)
   }
+}
+
+function getDownloadFiles(
+  metadata: MinecraftVersionMetadata,
+  gameDirectory: string
+): DownloadFile[] {
+  const client = metadata.downloads?.client
+
+  if (!client) {
+    throw new Error('Ta wersja nie zawiera pliku klienta.')
+  }
+
+  validateDownloadProperties(
+    'Plik klienta',
+    client.url,
+    client.sha1,
+    client.size
+  )
+
+  const paths = getVersionPaths(gameDirectory, metadata.id)
+  const files: DownloadFile[] = [
+    {
+      kind: 'client',
+      label: `Klient Minecraft ${metadata.id}`,
+      url: getTrustedMinecraftUrl(client.url),
+      sha1: client.sha1,
+      size: client.size,
+      targetPath: paths.jarPath,
+      temporaryPath: paths.temporaryPath
+    }
+  ]
+
+  const usedPaths = new Set<string>([paths.jarPath.toLowerCase()])
+
+  for (const library of metadata.libraries ?? []) {
+    if (!isLibraryAllowed(library)) {
+      continue
+    }
+
+    const artifact = library.downloads?.artifact
+
+    if (!artifact) {
+      throw new Error(
+        `Biblioteka ${library.name} nie zawiera pliku artifact.`
+      )
+    }
+
+    validateDownloadProperties(
+      `Biblioteka ${library.name}`,
+      artifact.url,
+      artifact.sha1,
+      artifact.size
+    )
+
+    const targetPath = resolveSafeLibraryPath(
+      paths.librariesDirectory,
+      artifact.path
+    )
+
+    const pathKey = targetPath.toLowerCase()
+
+    if (usedPaths.has(pathKey)) {
+      continue
+    }
+
+    usedPaths.add(pathKey)
+
+    files.push({
+      kind: 'library',
+      label: library.name,
+      url: getTrustedMinecraftUrl(artifact.url),
+      sha1: artifact.sha1,
+      size: artifact.size,
+      targetPath,
+      temporaryPath: `${targetPath}.part`
+    })
+  }
+
+  return files
 }
 
 async function calculateFileSha1(filePath: string): Promise<string> {
@@ -654,13 +900,11 @@ async function calculateFileSha1(filePath: string): Promise<string> {
   return hash.digest('hex')
 }
 
-async function inspectClientFile(
-  filePath: string,
-  expectedSize: number,
-  expectedSha1: string
+async function inspectDownloadFile(
+  file: DownloadFile
 ): Promise<FileInspection> {
   try {
-    const fileStats = await stat(filePath)
+    const fileStats = await stat(file.targetPath)
 
     if (!fileStats.isFile()) {
       return {
@@ -668,29 +912,29 @@ async function inspectClientFile(
         valid: false,
         size: null,
         sha1: null,
-        error: 'Ścieżka klienta nie wskazuje pliku.'
+        error: 'Ścieżka nie wskazuje pliku.'
       }
     }
 
-    if (fileStats.size !== expectedSize) {
+    if (fileStats.size !== file.size) {
       return {
         exists: true,
         valid: false,
         size: fileStats.size,
         sha1: null,
-        error: 'Rozmiar pliku klienta jest nieprawidłowy.'
+        error: 'Rozmiar pliku jest nieprawidłowy.'
       }
     }
 
-    const sha1 = await calculateFileSha1(filePath)
-    const valid = sha1.toLowerCase() === expectedSha1.toLowerCase()
+    const sha1 = await calculateFileSha1(file.targetPath)
+    const valid = sha1.toLowerCase() === file.sha1.toLowerCase()
 
     return {
       exists: true,
       valid,
       size: fileStats.size,
       sha1,
-      error: valid ? null : 'Suma SHA-1 pliku klienta jest nieprawidłowa.'
+      error: valid ? null : 'Suma SHA-1 pliku jest nieprawidłowa.'
     }
   } catch (error) {
     if (isFileNotFound(error)) {
@@ -719,29 +963,70 @@ async function getMinecraftInstallStatus(
 ): Promise<MinecraftInstallStatus> {
   try {
     const metadata = await getMinecraftVersionMetadata(versionId)
-    const client = metadata.downloads?.client
+    const files = getDownloadFiles(metadata, gameDirectory)
+    const clientFile = files[0]
+    const libraryFiles = files.slice(1)
+    const clientInspection = await inspectDownloadFile(clientFile)
 
-    if (!client) {
-      throw new Error('Ta wersja nie zawiera pliku klienta.')
+    let validLibraryCount = 0
+    let missingLibraryCount = 0
+    let invalidLibraryCount = 0
+    let firstLibraryError: string | null = null
+
+    for (const libraryFile of libraryFiles) {
+      const inspection = await inspectDownloadFile(libraryFile)
+
+      if (inspection.valid) {
+        validLibraryCount += 1
+      } else if (!inspection.exists) {
+        missingLibraryCount += 1
+      } else {
+        invalidLibraryCount += 1
+      }
+
+      if (!firstLibraryError && inspection.error) {
+        firstLibraryError = `${libraryFile.label}: ${inspection.error}`
+      }
     }
 
-    const { jarPath } = getVersionPaths(gameDirectory, versionId)
-    const inspection = await inspectClientFile(
-      jarPath,
-      client.size,
-      client.sha1
-    )
+    const valid =
+      clientInspection.valid &&
+      validLibraryCount === libraryFiles.length
+
+    let error: string | null = null
+
+    if (clientInspection.exists && !clientInspection.valid) {
+      error = clientInspection.error ?? 'Plik klienta jest uszkodzony.'
+    } else if (!clientInspection.exists) {
+      error = 'Brakuje pliku klienta.'
+    } else if (invalidLibraryCount > 0) {
+      error =
+        firstLibraryError ??
+        `Uszkodzone biblioteki: ${invalidLibraryCount}.`
+    } else if (missingLibraryCount > 0) {
+      error = `Brakuje bibliotek: ${missingLibraryCount}.`
+    }
 
     return {
       versionId,
-      installed: inspection.exists,
-      valid: inspection.valid,
-      jarPath,
-      currentSize: inspection.size,
-      expectedSize: client.size,
-      currentSha1: inspection.sha1,
-      expectedSha1: client.sha1,
-      error: inspection.error
+      installed:
+        clientInspection.exists || validLibraryCount > 0,
+      valid,
+      jarPath: clientFile.targetPath,
+      currentSize: clientInspection.size,
+      expectedSize: clientFile.size,
+      currentSha1: clientInspection.sha1,
+      expectedSha1: clientFile.sha1,
+      clientValid: clientInspection.valid,
+      libraryCount: libraryFiles.length,
+      validLibraryCount,
+      missingLibraryCount,
+      invalidLibraryCount,
+      totalExpectedSize: files.reduce(
+        (sum, file) => sum + file.size,
+        0
+      ),
+      error
     }
   } catch (error) {
     return {
@@ -753,6 +1038,12 @@ async function getMinecraftInstallStatus(
       expectedSize: null,
       currentSha1: null,
       expectedSha1: null,
+      clientValid: false,
+      libraryCount: 0,
+      validLibraryCount: 0,
+      missingLibraryCount: 0,
+      invalidLibraryCount: 0,
+      totalExpectedSize: null,
       error: getErrorMessage(error)
     }
   }
@@ -772,7 +1063,10 @@ function createProgress(
   phase: InstallPhase,
   downloadedBytes: number,
   totalBytes: number,
-  message: string
+  message: string,
+  currentFile: string | null,
+  completedFiles: number,
+  totalFiles: number
 ): MinecraftInstallProgress {
   const percent =
     totalBytes > 0
@@ -780,7 +1074,9 @@ function createProgress(
           100,
           Math.max(0, Math.floor((downloadedBytes / totalBytes) * 100))
         )
-      : 0
+      : phase === 'complete'
+        ? 100
+        : 0
 
   return {
     versionId,
@@ -788,17 +1084,187 @@ function createProgress(
     downloadedBytes,
     totalBytes,
     percent,
-    message
+    message,
+    currentFile,
+    completedFiles,
+    totalFiles
   }
 }
 
-async function installMinecraftClient(
+function shortenFileLabel(label: string): string {
+  return label.length > 64 ? `${label.slice(0, 61)}...` : label
+}
+
+async function downloadAndVerifyFile(
+  sender: WebContents,
+  versionId: string,
+  file: DownloadFile,
+  completedBytes: number,
+  totalBytes: number,
+  completedFiles: number,
+  totalFiles: number
+): Promise<void> {
+  await mkdir(dirname(file.targetPath), {
+    recursive: true
+  })
+
+  await rm(file.temporaryPath, {
+    force: true
+  })
+
+  const controller = new AbortController()
+  const timeout = setTimeout(
+    () => controller.abort(),
+    DOWNLOAD_TIMEOUT
+  )
+
+  try {
+    const response = await net.fetch(file.url, {
+      method: 'GET',
+      signal: controller.signal
+    })
+
+    if (!response.ok) {
+      throw new Error(
+        `Pobieranie ${file.label} zakończyło się błędem HTTP ${response.status}.`
+      )
+    }
+
+    if (!response.body) {
+      throw new Error(`${file.label}: serwer nie zwrócił danych pliku.`)
+    }
+
+    const reader = response.body.getReader()
+    const fileHandle = await open(file.temporaryPath, 'w')
+    const hash = createHash('sha1')
+    let currentFileBytes = 0
+    let lastProgressUpdate = 0
+    const shortLabel = shortenFileLabel(file.label)
+
+    sendInstallProgress(
+      sender,
+      createProgress(
+        versionId,
+        'downloading',
+        completedBytes,
+        totalBytes,
+        `Pobieranie: ${shortLabel}`,
+        shortLabel,
+        completedFiles,
+        totalFiles
+      )
+    )
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+
+        if (done) {
+          break
+        }
+
+        if (!value || value.byteLength === 0) {
+          continue
+        }
+
+        const buffer = Buffer.from(value)
+        let offset = 0
+
+        while (offset < buffer.length) {
+          const { bytesWritten } = await fileHandle.write(
+            buffer,
+            offset,
+            buffer.length - offset
+          )
+
+          if (bytesWritten <= 0) {
+            throw new Error('Nie udało się zapisać pobieranego pliku.')
+          }
+
+          offset += bytesWritten
+        }
+
+        hash.update(buffer)
+        currentFileBytes += buffer.length
+
+        const now = Date.now()
+
+        if (
+          now - lastProgressUpdate >= 100 ||
+          currentFileBytes >= file.size
+        ) {
+          lastProgressUpdate = now
+
+          sendInstallProgress(
+            sender,
+            createProgress(
+              versionId,
+              'downloading',
+              completedBytes + currentFileBytes,
+              totalBytes,
+              `Pobieranie: ${shortLabel}`,
+              shortLabel,
+              completedFiles,
+              totalFiles
+            )
+          )
+        }
+      }
+    } finally {
+      reader.releaseLock()
+      await fileHandle.close()
+    }
+
+    sendInstallProgress(
+      sender,
+      createProgress(
+        versionId,
+        'verifying',
+        completedBytes + currentFileBytes,
+        totalBytes,
+        `Sprawdzanie: ${shortLabel}`,
+        shortLabel,
+        completedFiles,
+        totalFiles
+      )
+    )
+
+    const downloadedSha1 = hash.digest('hex')
+
+    if (currentFileBytes !== file.size) {
+      throw new Error(
+        `${file.label}: pobrano ${currentFileBytes} bajtów, oczekiwano ${file.size}.`
+      )
+    }
+
+    if (downloadedSha1.toLowerCase() !== file.sha1.toLowerCase()) {
+      throw new Error(`${file.label}: nieprawidłowa suma SHA-1.`)
+    }
+
+    await rm(file.targetPath, {
+      force: true
+    })
+
+    await rename(file.temporaryPath, file.targetPath)
+  } catch (error) {
+    await rm(file.temporaryPath, {
+      force: true
+    }).catch(() => undefined)
+
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function installMinecraftVersion(
   sender: WebContents,
   versionId: string,
   gameDirectory: string
 ): Promise<MinecraftInstallResult> {
-  let temporaryPath: string | null = null
   let installationKey: string | null = null
+  let libraryCount = 0
+  let downloadedFileCount = 0
 
   try {
     const safeGameDirectory = validateGameDirectory(gameDirectory)
@@ -810,6 +1276,8 @@ async function installMinecraftClient(
         alreadyInstalled: false,
         versionId,
         jarPath: null,
+        libraryCount: 0,
+        downloadedFileCount: 0,
         error: 'Instalacja tej wersji już trwa.'
       }
     }
@@ -823,22 +1291,23 @@ async function installMinecraftClient(
         'checking',
         0,
         0,
-        'Sprawdzanie pliku klienta...'
+        'Sprawdzanie klienta i bibliotek...',
+        null,
+        0,
+        0
       )
     )
 
     const metadata = await getMinecraftVersionMetadata(versionId)
-    const client = metadata.downloads?.client
-
-    if (!client) {
-      throw new Error('Ta wersja nie zawiera pliku klienta.')
-    }
-
-    const trustedClientUrl = getTrustedMinecraftUrl(client.url)
+    const files = getDownloadFiles(metadata, safeGameDirectory)
     const paths = getVersionPaths(safeGameDirectory, versionId)
-    temporaryPath = paths.temporaryPath
+    libraryCount = files.filter((file) => file.kind === 'library').length
 
     await mkdir(paths.versionDirectory, {
+      recursive: true
+    })
+
+    await mkdir(paths.librariesDirectory, {
       recursive: true
     })
 
@@ -848,21 +1317,44 @@ async function installMinecraftClient(
       'utf8'
     )
 
-    const existingFile = await inspectClientFile(
-      paths.jarPath,
-      client.size,
-      client.sha1
-    )
+    const filesToDownload: DownloadFile[] = []
 
-    if (existingFile.valid) {
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index]
+
+      sendInstallProgress(
+        sender,
+        createProgress(
+          versionId,
+          'checking',
+          0,
+          0,
+          `Sprawdzanie plików ${index + 1}/${files.length}...`,
+          shortenFileLabel(file.label),
+          index,
+          files.length
+        )
+      )
+
+      const inspection = await inspectDownloadFile(file)
+
+      if (!inspection.valid) {
+        filesToDownload.push(file)
+      }
+    }
+
+    if (filesToDownload.length === 0) {
       sendInstallProgress(
         sender,
         createProgress(
           versionId,
           'complete',
-          client.size,
-          client.size,
-          'Plik klienta jest już poprawnie zainstalowany.'
+          0,
+          0,
+          'Klient i biblioteki są już poprawnie zainstalowane.',
+          null,
+          files.length,
+          files.length
         )
       )
 
@@ -871,160 +1363,76 @@ async function installMinecraftClient(
         alreadyInstalled: true,
         versionId,
         jarPath: paths.jarPath,
+        libraryCount,
+        downloadedFileCount: 0,
         error: null
       }
     }
 
-    await rm(paths.temporaryPath, {
-      force: true
-    })
-
-    const controller = new AbortController()
-    const timeout = setTimeout(
-      () => controller.abort(),
-      DOWNLOAD_TIMEOUT
+    const totalBytes = filesToDownload.reduce(
+      (sum, file) => sum + file.size,
+      0
     )
 
-    try {
-      const response = await net.fetch(trustedClientUrl, {
-        method: 'GET',
-        signal: controller.signal
-      })
+    let completedBytes = 0
 
-      if (!response.ok) {
-        throw new Error(
-          `Pobieranie klienta zakończyło się błędem HTTP ${response.status}.`
-        )
-      }
+    for (
+      let index = 0;
+      index < filesToDownload.length;
+      index += 1
+    ) {
+      const file = filesToDownload[index]
 
-      if (!response.body) {
-        throw new Error('Serwer nie zwrócił danych pliku klienta.')
-      }
+      await downloadAndVerifyFile(
+        sender,
+        versionId,
+        file,
+        completedBytes,
+        totalBytes,
+        index,
+        filesToDownload.length
+      )
 
-      const reader = response.body.getReader()
-      const fileHandle = await open(paths.temporaryPath, 'w')
-      const hash = createHash('sha1')
-      let downloadedBytes = 0
-      let lastProgressUpdate = 0
+      completedBytes += file.size
+      downloadedFileCount = index + 1
 
       sendInstallProgress(
         sender,
         createProgress(
           versionId,
           'downloading',
-          0,
-          client.size,
-          'Pobieranie pliku klienta...'
+          completedBytes,
+          totalBytes,
+          `Pobrano plik ${index + 1}/${filesToDownload.length}.`,
+          shortenFileLabel(file.label),
+          index + 1,
+          filesToDownload.length
         )
       )
+    }
 
-      try {
-        while (true) {
-          const { done, value } = await reader.read()
-
-          if (done) {
-            break
-          }
-
-          if (!value || value.byteLength === 0) {
-            continue
-          }
-
-          const buffer = Buffer.from(value)
-          let offset = 0
-
-          while (offset < buffer.length) {
-            const { bytesWritten } = await fileHandle.write(
-              buffer,
-              offset,
-              buffer.length - offset
-            )
-
-            if (bytesWritten <= 0) {
-              throw new Error('Nie udało się zapisać pobieranego pliku.')
-            }
-
-            offset += bytesWritten
-          }
-
-          hash.update(buffer)
-          downloadedBytes += buffer.length
-
-          const now = Date.now()
-
-          if (
-            now - lastProgressUpdate >= 100 ||
-            downloadedBytes >= client.size
-          ) {
-            lastProgressUpdate = now
-
-            sendInstallProgress(
-              sender,
-              createProgress(
-                versionId,
-                'downloading',
-                downloadedBytes,
-                client.size,
-                'Pobieranie pliku klienta...'
-              )
-            )
-          }
-        }
-      } finally {
-        reader.releaseLock()
-        await fileHandle.close()
-      }
-
-      sendInstallProgress(
-        sender,
-        createProgress(
-          versionId,
-          'verifying',
-          downloadedBytes,
-          client.size,
-          'Sprawdzanie rozmiaru i sumy SHA-1...'
-        )
-      )
-
-      const downloadedSha1 = hash.digest('hex')
-
-      if (downloadedBytes !== client.size) {
-        throw new Error(
-          `Pobrano ${downloadedBytes} bajtów, oczekiwano ${client.size}.`
-        )
-      }
-
-      if (downloadedSha1.toLowerCase() !== client.sha1.toLowerCase()) {
-        throw new Error('Pobrany plik ma nieprawidłową sumę SHA-1.')
-      }
-
-      await rm(paths.jarPath, {
-        force: true
-      })
-
-      await rename(paths.temporaryPath, paths.jarPath)
-      temporaryPath = null
-
-      sendInstallProgress(
-        sender,
-        createProgress(
-          versionId,
-          'complete',
-          client.size,
-          client.size,
-          'Plik klienta został poprawnie zainstalowany.'
-        )
-      )
-
-      return {
-        success: true,
-        alreadyInstalled: false,
+    sendInstallProgress(
+      sender,
+      createProgress(
         versionId,
-        jarPath: paths.jarPath,
-        error: null
-      }
-    } finally {
-      clearTimeout(timeout)
+        'complete',
+        totalBytes,
+        totalBytes,
+        `Zainstalowano klienta i ${libraryCount} bibliotek.`,
+        null,
+        filesToDownload.length,
+        filesToDownload.length
+      )
+    )
+
+    return {
+      success: true,
+      alreadyInstalled: false,
+      versionId,
+      jarPath: paths.jarPath,
+      libraryCount,
+      downloadedFileCount,
+      error: null
     }
   } catch (error) {
     const message = getErrorMessage(error)
@@ -1036,7 +1444,10 @@ async function installMinecraftClient(
         'error',
         0,
         0,
-        message
+        message,
+        null,
+        downloadedFileCount,
+        downloadedFileCount
       )
     )
 
@@ -1045,15 +1456,11 @@ async function installMinecraftClient(
       alreadyInstalled: false,
       versionId,
       jarPath: null,
+      libraryCount,
+      downloadedFileCount,
       error: message
     }
   } finally {
-    if (temporaryPath) {
-      await rm(temporaryPath, {
-        force: true
-      }).catch(() => undefined)
-    }
-
     if (installationKey) {
       activeInstallations.delete(installationKey)
     }
@@ -1196,6 +1603,12 @@ app.whenReady().then(() => {
           expectedSize: null,
           currentSha1: null,
           expectedSha1: null,
+          clientValid: false,
+          libraryCount: 0,
+          validLibraryCount: 0,
+          missingLibraryCount: 0,
+          invalidLibraryCount: 0,
+          totalExpectedSize: null,
           error: 'Nieprawidłowe dane sprawdzania instalacji.'
         } satisfies MinecraftInstallStatus
       }
@@ -1205,7 +1618,7 @@ app.whenReady().then(() => {
   )
 
   ipcMain.handle(
-    'minecraft:install-client',
+    'minecraft:install-version',
     async (event, versionId: unknown, gameDirectory: unknown) => {
       if (
         typeof versionId !== 'string' ||
@@ -1216,11 +1629,13 @@ app.whenReady().then(() => {
           alreadyInstalled: false,
           versionId: '',
           jarPath: null,
+          libraryCount: 0,
+          downloadedFileCount: 0,
           error: 'Nieprawidłowe dane instalacji.'
         } satisfies MinecraftInstallResult
       }
 
-      return installMinecraftClient(
+      return installMinecraftVersion(
         event.sender,
         versionId,
         gameDirectory

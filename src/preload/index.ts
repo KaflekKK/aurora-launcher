@@ -58,6 +58,9 @@ interface MinecraftInstallProgress {
   totalBytes: number
   percent: number
   message: string
+  currentFile: string | null
+  completedFiles: number
+  totalFiles: number
 }
 
 interface MinecraftInstallStatus {
@@ -69,6 +72,12 @@ interface MinecraftInstallStatus {
   expectedSize: number | null
   currentSha1: string | null
   expectedSha1: string | null
+  clientValid: boolean
+  libraryCount: number
+  validLibraryCount: number
+  missingLibraryCount: number
+  invalidLibraryCount: number
+  totalExpectedSize: number | null
   error: string | null
 }
 
@@ -77,6 +86,8 @@ interface MinecraftInstallResult {
   alreadyInstalled: boolean
   versionId: string
   jarPath: string | null
+  libraryCount: number
+  downloadedFileCount: number
   error: string | null
 }
 
@@ -98,7 +109,7 @@ interface AuroraAPI {
     gameDirectory: string
   ) => Promise<MinecraftInstallStatus>
 
-  installMinecraftClient: (
+  installMinecraftVersion: (
     versionId: string,
     gameDirectory: string
   ) => Promise<MinecraftInstallResult>
@@ -154,12 +165,12 @@ const api: AuroraAPI = {
     ) as Promise<MinecraftInstallStatus>
   },
 
-  installMinecraftClient: async (
+  installMinecraftVersion: async (
     versionId: string,
     gameDirectory: string
   ): Promise<MinecraftInstallResult> => {
     return ipcRenderer.invoke(
-      'minecraft:install-client',
+      'minecraft:install-version',
       versionId,
       gameDirectory
     ) as Promise<MinecraftInstallResult>
