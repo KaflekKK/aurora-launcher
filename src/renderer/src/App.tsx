@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import auroraIcon from './assets/branding/aurora-icon.png'
+import auroraLogoHorizontal from './assets/branding/aurora-logo-horizontal.png'
+import auroraLogoMain from './assets/branding/aurora-logo-main.png'
 
 type Page = 'home' | 'profiles' | 'settings'
 type MinecraftVersion = '1.21.11' | '1.21.4' | '1.20.1'
@@ -974,11 +977,13 @@ function App(): React.JSX.Element {
     <div className="launcher">
       <aside className="sidebar">
         <div className="logo-area">
-          <div className="logo">A</div>
+          <div className="logo">
+            <img src={auroraIcon} alt="Aurora Client" />
+          </div>
 
           <div className="logo-name">
             <strong>Aurora</strong>
-            <span>LAUNCHER</span>
+            <span>CLIENT</span>
           </div>
         </div>
 
@@ -1046,7 +1051,7 @@ function App(): React.JSX.Element {
             </div>
           </button>
 
-          <span className="app-version">Aurora Launcher v0.12.0</span>
+          <span className="app-version">Aurora Client v0.12.1</span>
         </div>
       </aside>
 
@@ -1069,23 +1074,37 @@ function App(): React.JSX.Element {
         {page === 'home' && (
           <section className="home-page">
             <div className="hero">
-              <div className="hero-tag">
-                <span />
-                AURORA CLIENT
-              </div>
+              <img
+                className="hero-background-logo"
+                src={auroraLogoMain}
+                alt=""
+                aria-hidden="true"
+              />
 
-              <h1>
-                Zagraj po
-                <br />
-                <strong>swojemu.</strong>
-              </h1>
+              <div className="hero-content">
+                <img
+                  className="hero-wordmark"
+                  src={auroraLogoHorizontal}
+                  alt="Aurora Client"
+                />
 
-              <p>
-                Nowoczesny, szybki i lekki launcher Minecraft. Wszystkie
-                profile, ustawienia i mody w jednym miejscu.
-              </p>
+                <div className="hero-tag">
+                  <span />
+                  TWOJE MIEJSCE DO GRY
+                </div>
 
-              <div className="features">
+                <h1>
+                  Zagraj po
+                  <br />
+                  <strong>swojemu.</strong>
+                </h1>
+
+                <p>
+                  Nowoczesny klient Minecraft z własnymi profilami,
+                  instalacją gry i bezpiecznym logowaniem Microsoft.
+                </p>
+
+                <div className="features">
                 <div className="feature">
                   <strong>Szybki</strong>
                   <span>Proste uruchamianie gry</span>
@@ -1100,6 +1119,7 @@ function App(): React.JSX.Element {
                   <strong>Nowoczesny</strong>
                   <span>Własny klient i mody</span>
                 </div>
+              </div>
               </div>
             </div>
 
