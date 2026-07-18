@@ -44,7 +44,12 @@ interface MinecraftVersionDetails {
 }
 
 type InstallPhase =
-  'checking' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error'
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
+  | 'extracting'
+  | 'complete'
+  | 'error'
 
 interface MinecraftInstallProgress {
   versionId: string
@@ -105,7 +110,13 @@ interface MinecraftInstallResult {
 }
 
 type MinecraftRunMode = 'microsoft' | 'ui-test'
-type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
+
+type MinecraftGamePhase =
+  | 'idle'
+  | 'starting'
+  | 'running'
+  | 'stopped'
+  | 'error'
 
 interface MicrosoftAccountState {
   signedIn: boolean
@@ -120,6 +131,16 @@ interface MicrosoftLoginResult extends MicrosoftAccountState {
   success: boolean
 }
 
+type AuroraRenderer = 'sodium' | 'vulkan'
+
+type AuroraProfileId =
+  | '1.20.1-sodium'
+  | '1.20.1-vulkan'
+  | '1.21.4-sodium'
+  | '1.21.4-vulkan'
+  | '1.21.11-sodium'
+  | '1.21.11-vulkan'
+
 interface MinecraftLaunchRequest {
   versionId: string
   gameDirectory: string
@@ -127,6 +148,8 @@ interface MinecraftLaunchRequest {
   username: string | null
   ram: number
   profileName: string
+  profileId: AuroraProfileId | null
+  renderer: AuroraRenderer | null
   minimizeOnLaunch: boolean
   closeOnLaunch: boolean
 }
@@ -198,15 +221,25 @@ interface AuroraAPI {
 
   stopMinecraftGame: () => Promise<boolean>
 
-  onGameLog: (callback: (log: MinecraftGameLog) => void) => void
+  onGameLog: (
+    callback: (log: MinecraftGameLog) => void
+  ) => void
 
-  onGameState: (callback: (state: MinecraftGameState) => void) => void
+  onGameState: (
+    callback: (state: MinecraftGameState) => void
+  ) => void
 
   removeGameListeners: () => void
 
   getDefaultGameDirectory: () => Promise<string>
 
-  chooseGameDirectory: (currentPath: string | null) => Promise<string | null>
+  chooseGameDirectory: (
+    currentPath: string | null
+  ) => Promise<string | null>
+
+  openUserModsFolder: (
+    gameDirectory: string
+  ) => Promise<boolean>
 }
 
 declare global {

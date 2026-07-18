@@ -312,16 +312,6 @@ interface MicrosoftLoginResult extends MicrosoftAccountState {
   success: boolean
 }
 
-type AuroraRenderer = 'sodium' | 'vulkan'
-
-type AuroraProfileId =
-  | '1.20.1-sodium'
-  | '1.20.1-vulkan'
-  | '1.21.4-sodium'
-  | '1.21.4-vulkan'
-  | '1.21.11-sodium'
-  | '1.21.11-vulkan'
-
 interface MinecraftLaunchRequest {
   versionId: string
   gameDirectory: string
@@ -329,8 +319,6 @@ interface MinecraftLaunchRequest {
   username: string | null
   ram: number
   profileName: string
-  profileId: AuroraProfileId | null
-  renderer: AuroraRenderer | null
   minimizeOnLaunch: boolean
   closeOnLaunch: boolean
 }
@@ -3899,21 +3887,6 @@ async function chooseGameDirectory(
   return result.filePaths[0] ?? null
 }
 
-async function openUserModsFolder(gameDirectory: string): Promise<boolean> {
-  try {
-    const safeGameDirectory = validateGameDirectory(gameDirectory)
-    const userModsDirectory = join(safeGameDirectory, 'mods')
-
-    await mkdir(userModsDirectory, { recursive: true })
-
-    const errorMessage = await shell.openPath(userModsDirectory)
-
-    return errorMessage.length === 0
-  } catch {
-    return false
-  }
-}
-
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1100,
@@ -4085,16 +4058,6 @@ app.whenReady().then(() => {
         typeof launchRequest.username !== 'string') ||
       typeof launchRequest.ram !== 'number' ||
       typeof launchRequest.profileName !== 'string' ||
-      (launchRequest.profileId !== null &&
-        launchRequest.profileId !== '1.20.1-sodium' &&
-        launchRequest.profileId !== '1.20.1-vulkan' &&
-        launchRequest.profileId !== '1.21.4-sodium' &&
-        launchRequest.profileId !== '1.21.4-vulkan' &&
-        launchRequest.profileId !== '1.21.11-sodium' &&
-        launchRequest.profileId !== '1.21.11-vulkan') ||
-      (launchRequest.renderer !== null &&
-        launchRequest.renderer !== 'sodium' &&
-        launchRequest.renderer !== 'vulkan') ||
       typeof launchRequest.minimizeOnLaunch !== 'boolean' ||
       typeof launchRequest.closeOnLaunch !== 'boolean'
     ) {
@@ -4134,17 +4097,6 @@ app.whenReady().then(() => {
         parentWindow,
         typeof currentPath === 'string' ? currentPath : null
       )
-    }
-  )
-
-  ipcMain.handle(
-    'folder:open-user-mods',
-    async (_event, gameDirectory: unknown) => {
-      if (typeof gameDirectory !== 'string') {
-        return false
-      }
-
-      return openUserModsFolder(gameDirectory)
     }
   )
 

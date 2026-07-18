@@ -6,8 +6,6 @@ import auroraLogoMain from './assets/branding/aurora-logo-main.png'
 type Page = 'home' | 'profiles' | 'settings'
 type MinecraftVersion = '1.21.11' | '1.21.4' | '1.20.1'
 type GameProfile = 'aurora' | 'vanilla'
-type AuroraRenderer = 'sodium' | 'vulkan'
-type AuroraProfileId = `${MinecraftVersion}-${AuroraRenderer}`
 
 type InstallPhase =
   'checking' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error'
@@ -15,7 +13,6 @@ type InstallPhase =
 interface LauncherSettings {
   selectedProfile: GameProfile
   minecraftVersion: MinecraftVersion
-  renderer: AuroraRenderer
   ram: number
   gameDirectory: string
   minimizeOnLaunch: boolean
@@ -160,7 +157,6 @@ const SETTINGS_KEY = 'aurora-launcher-settings'
 const DEFAULT_SETTINGS: LauncherSettings = {
   selectedProfile: 'aurora',
   minecraftVersion: '1.21.11',
-  renderer: 'sodium',
   ram: 4,
   gameDirectory: '',
   minimizeOnLaunch: true,
@@ -173,10 +169,6 @@ function isMinecraftVersion(value: unknown): value is MinecraftVersion {
 
 function isGameProfile(value: unknown): value is GameProfile {
   return value === 'aurora' || value === 'vanilla'
-}
-
-function isAuroraRenderer(value: unknown): value is AuroraRenderer {
-  return value === 'sodium' || value === 'vulkan'
 }
 
 function loadSettings(): LauncherSettings {
@@ -197,10 +189,6 @@ function loadSettings(): LauncherSettings {
       minecraftVersion: isMinecraftVersion(parsed.minecraftVersion)
         ? parsed.minecraftVersion
         : DEFAULT_SETTINGS.minecraftVersion,
-
-      renderer: isAuroraRenderer(parsed.renderer)
-        ? parsed.renderer
-        : DEFAULT_SETTINGS.renderer,
 
       ram:
         typeof parsed.ram === 'number' && parsed.ram >= 2 && parsed.ram <= 16
@@ -331,9 +319,6 @@ function App(): React.JSX.Element {
   const [accountError, setAccountError] = useState<string | null>(null)
   const [minecraftVersion, setMinecraftVersion] = useState<MinecraftVersion>(
     initialSettings.minecraftVersion
-  )
-  const [renderer, setRenderer] = useState<AuroraRenderer>(
-    initialSettings.renderer
   )
   const [ram, setRam] = useState(initialSettings.ram)
   const [gameDirectory, setGameDirectory] = useState(
@@ -620,7 +605,6 @@ function App(): React.JSX.Element {
     const settings: LauncherSettings = {
       selectedProfile,
       minecraftVersion,
-      renderer,
       ram,
       gameDirectory,
       minimizeOnLaunch,
@@ -821,11 +805,6 @@ function App(): React.JSX.Element {
           username: null,
           ram,
           profileName: selectedProfileName,
-          profileId:
-            selectedProfile === 'aurora'
-              ? (`${minecraftVersion}-${renderer}` as AuroraProfileId)
-              : null,
-          renderer: selectedProfile === 'aurora' ? renderer : null,
           minimizeOnLaunch,
           closeOnLaunch
         })
@@ -879,8 +858,6 @@ function App(): React.JSX.Element {
           username: testUsername,
           ram,
           profileName: 'Aurora UI Test',
-          profileId: `${minecraftVersion}-${renderer}` as AuroraProfileId,
-          renderer,
           minimizeOnLaunch: false,
           closeOnLaunch: false
         })
@@ -1046,7 +1023,7 @@ function App(): React.JSX.Element {
   const selectedProfileDescription =
     selectedProfile === 'vanilla'
       ? 'Czysty Minecraft Java Edition'
-      : `Minecraft Java Edition · ${renderer === 'sodium' ? 'Sodium' : 'Vulkan'}`
+      : 'Minecraft Java Edition'
 
   const selectedAccountInitial =
     microsoftAccount.username?.charAt(0).toUpperCase() ?? '?'
@@ -1228,24 +1205,6 @@ function App(): React.JSX.Element {
                   <option value="1.20.1">Minecraft 1.20.1</option>
                 </select>
 
-                {selectedProfile === 'aurora' && (
-                  <>
-                    <label htmlFor="aurora-renderer">Renderer</label>
-
-                    <select
-                      id="aurora-renderer"
-                      value={renderer}
-                      disabled={installing || gameState.running}
-                      onChange={(event) =>
-                        setRenderer(event.target.value as AuroraRenderer)
-                      }
-                    >
-                      <option value="sodium">Sodium — stabilny</option>
-                      <option value="vulkan">Vulkan — eksperymentalny</option>
-                    </select>
-                  </>
-                )}
-
                 <span
                   style={{
                     color: baseFilesInstalled ? '#c084fc' : '#a89bad',
@@ -1383,7 +1342,7 @@ function App(): React.JSX.Element {
 
                 <div className="card-text">
                   <h2>Aurora Client</h2>
-                  <p>Minecraft {minecraftVersion} · {renderer === 'sodium' ? 'Sodium' : 'Vulkan'}</p>
+                  <p>Minecraft {minecraftVersion} · Profil Aurora</p>
                 </div>
 
                 {selectedProfile === 'aurora' ? (

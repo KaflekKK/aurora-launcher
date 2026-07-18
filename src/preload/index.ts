@@ -45,7 +45,12 @@ interface MinecraftVersionDetails {
 }
 
 type InstallPhase =
-  'checking' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error'
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
+  | 'extracting'
+  | 'complete'
+  | 'error'
 
 interface MinecraftInstallProgress {
   versionId: string
@@ -106,7 +111,13 @@ interface MinecraftInstallResult {
 }
 
 type MinecraftRunMode = 'microsoft' | 'ui-test'
-type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
+
+type MinecraftGamePhase =
+  | 'idle'
+  | 'starting'
+  | 'running'
+  | 'stopped'
+  | 'error'
 
 interface MicrosoftAccountState {
   signedIn: boolean
@@ -121,6 +132,16 @@ interface MicrosoftLoginResult extends MicrosoftAccountState {
   success: boolean
 }
 
+type AuroraRenderer = 'sodium' | 'vulkan'
+
+type AuroraProfileId =
+  | '1.20.1-sodium'
+  | '1.20.1-vulkan'
+  | '1.21.4-sodium'
+  | '1.21.4-vulkan'
+  | '1.21.11-sodium'
+  | '1.21.11-vulkan'
+
 interface MinecraftLaunchRequest {
   versionId: string
   gameDirectory: string
@@ -128,6 +149,8 @@ interface MinecraftLaunchRequest {
   username: string | null
   ram: number
   profileName: string
+  profileId: AuroraProfileId | null
+  renderer: AuroraRenderer | null
   minimizeOnLaunch: boolean
   closeOnLaunch: boolean
 }
@@ -199,20 +222,32 @@ interface AuroraAPI {
 
   stopMinecraftGame: () => Promise<boolean>
 
-  onGameLog: (callback: (log: MinecraftGameLog) => void) => void
+  onGameLog: (
+    callback: (log: MinecraftGameLog) => void
+  ) => void
 
-  onGameState: (callback: (state: MinecraftGameState) => void) => void
+  onGameState: (
+    callback: (state: MinecraftGameState) => void
+  ) => void
 
   removeGameListeners: () => void
 
   getDefaultGameDirectory: () => Promise<string>
 
-  chooseGameDirectory: (currentPath: string | null) => Promise<string | null>
+  chooseGameDirectory: (
+    currentPath: string | null
+  ) => Promise<string | null>
+
+  openUserModsFolder: (
+    gameDirectory: string
+  ) => Promise<boolean>
 }
 
 const api: AuroraAPI = {
   getJavaInfo: async (): Promise<JavaInfo> => {
-    return ipcRenderer.invoke('java:get-info') as Promise<JavaInfo>
+    return ipcRenderer.invoke(
+      'java:get-info'
+    ) as Promise<JavaInfo>
   },
 
   checkMinecraftVersion: async (
@@ -262,7 +297,9 @@ const api: AuroraAPI = {
   onInstallProgress: (
     callback: (progress: MinecraftInstallProgress) => void
   ): void => {
-    ipcRenderer.removeAllListeners('minecraft:install-progress')
+    ipcRenderer.removeAllListeners(
+      'minecraft:install-progress'
+    )
 
     ipcRenderer.on(
       'minecraft:install-progress',
@@ -273,7 +310,9 @@ const api: AuroraAPI = {
   },
 
   removeInstallProgressListener: (): void => {
-    ipcRenderer.removeAllListeners('minecraft:install-progress')
+    ipcRenderer.removeAllListeners(
+      'minecraft:install-progress'
+    )
   },
 
   getMicrosoftAccount: async (): Promise<MicrosoftAccountState> => {
@@ -289,7 +328,9 @@ const api: AuroraAPI = {
   },
 
   logoutMicrosoft: async (): Promise<boolean> => {
-    return ipcRenderer.invoke('auth:logout-microsoft') as Promise<boolean>
+    return ipcRenderer.invoke(
+      'auth:logout-microsoft'
+    ) as Promise<boolean>
   },
 
   launchMinecraftGame: async (
@@ -308,18 +349,33 @@ const api: AuroraAPI = {
   },
 
   stopMinecraftGame: async (): Promise<boolean> => {
-    return ipcRenderer.invoke('minecraft:stop-game') as Promise<boolean>
+    return ipcRenderer.invoke(
+      'minecraft:stop-game'
+    ) as Promise<boolean>
   },
 
-  onGameLog: (callback: (log: MinecraftGameLog) => void): void => {
-    ipcRenderer.removeAllListeners('minecraft:game-log')
-    ipcRenderer.on('minecraft:game-log', (_event, log: MinecraftGameLog) => {
-      callback(log)
-    })
+  onGameLog: (
+    callback: (log: MinecraftGameLog) => void
+  ): void => {
+    ipcRenderer.removeAllListeners(
+      'minecraft:game-log'
+    )
+
+    ipcRenderer.on(
+      'minecraft:game-log',
+      (_event, log: MinecraftGameLog) => {
+        callback(log)
+      }
+    )
   },
 
-  onGameState: (callback: (state: MinecraftGameState) => void): void => {
-    ipcRenderer.removeAllListeners('minecraft:game-state')
+  onGameState: (
+    callback: (state: MinecraftGameState) => void
+  ): void => {
+    ipcRenderer.removeAllListeners(
+      'minecraft:game-state'
+    )
+
     ipcRenderer.on(
       'minecraft:game-state',
       (_event, state: MinecraftGameState) => {
@@ -329,8 +385,13 @@ const api: AuroraAPI = {
   },
 
   removeGameListeners: (): void => {
-    ipcRenderer.removeAllListeners('minecraft:game-log')
-    ipcRenderer.removeAllListeners('minecraft:game-state')
+    ipcRenderer.removeAllListeners(
+      'minecraft:game-log'
+    )
+
+    ipcRenderer.removeAllListeners(
+      'minecraft:game-state'
+    )
   },
 
   getDefaultGameDirectory: async (): Promise<string> => {
@@ -346,8 +407,24 @@ const api: AuroraAPI = {
       'folder:choose-game-directory',
       currentPath
     ) as Promise<string | null>
+  },
+
+  openUserModsFolder: async (
+    gameDirectory: string
+  ): Promise<boolean> => {
+    return ipcRenderer.invoke(
+      'folder:open-user-mods',
+      gameDirectory
+    ) as Promise<boolean>
   }
 }
 
-contextBridge.exposeInMainWorld('electron', electronAPI)
-contextBridge.exposeInMainWorld('api', api)
+contextBridge.exposeInMainWorld(
+  'electron',
+  electronAPI
+)
+
+contextBridge.exposeInMainWorld(
+  'api',
+  api
+)

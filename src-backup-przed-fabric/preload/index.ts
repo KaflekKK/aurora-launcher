@@ -1,6 +1,5 @@
-/// <reference types="vite/client" />
-
-import type { ElectronAPI } from '@electron-toolkit/preload'
+import { contextBridge, ipcRenderer } from 'electron'
+import { electronAPI } from '@electron-toolkit/preload'
 
 interface JavaInfo {
   installed: boolean
@@ -46,12 +45,7 @@ interface MinecraftVersionDetails {
 }
 
 type InstallPhase =
-  | 'checking'
-  | 'downloading'
-  | 'verifying'
-  | 'extracting'
-  | 'complete'
-  | 'error'
+  'checking' | 'downloading' | 'verifying' | 'extracting' | 'complete' | 'error'
 
 interface MinecraftInstallProgress {
   versionId: string
@@ -112,13 +106,7 @@ interface MinecraftInstallResult {
 }
 
 type MinecraftRunMode = 'microsoft' | 'ui-test'
-
-type MinecraftGamePhase =
-  | 'idle'
-  | 'starting'
-  | 'running'
-  | 'stopped'
-  | 'error'
+type MinecraftGamePhase = 'idle' | 'starting' | 'running' | 'stopped' | 'error'
 
 interface MicrosoftAccountState {
   signedIn: boolean
@@ -133,16 +121,6 @@ interface MicrosoftLoginResult extends MicrosoftAccountState {
   success: boolean
 }
 
-type AuroraRenderer = 'sodium' | 'vulkan'
-
-type AuroraProfileId =
-  | '1.20.1-sodium'
-  | '1.20.1-vulkan'
-  | '1.21.4-sodium'
-  | '1.21.4-vulkan'
-  | '1.21.11-sodium'
-  | '1.21.11-vulkan'
-
 interface MinecraftLaunchRequest {
   versionId: string
   gameDirectory: string
@@ -150,8 +128,6 @@ interface MinecraftLaunchRequest {
   username: string | null
   ram: number
   profileName: string
-  profileId: AuroraProfileId | null
-  renderer: AuroraRenderer | null
   minimizeOnLaunch: boolean
   closeOnLaunch: boolean
 }
@@ -223,32 +199,155 @@ interface AuroraAPI {
 
   stopMinecraftGame: () => Promise<boolean>
 
-  onGameLog: (
-    callback: (log: MinecraftGameLog) => void
-  ) => void
+  onGameLog: (callback: (log: MinecraftGameLog) => void) => void
 
-  onGameState: (
-    callback: (state: MinecraftGameState) => void
-  ) => void
+  onGameState: (callback: (state: MinecraftGameState) => void) => void
 
   removeGameListeners: () => void
 
   getDefaultGameDirectory: () => Promise<string>
 
-  chooseGameDirectory: (
-    currentPath: string | null
-  ) => Promise<string | null>
-
-  openUserModsFolder: (
-    gameDirectory: string
-  ) => Promise<boolean>
+  chooseGameDirectory: (currentPath: string | null) => Promise<string | null>
 }
 
-declare global {
-  interface Window {
-    electron: ElectronAPI
-    api: AuroraAPI
+const api: AuroraAPI = {
+  getJavaInfo: async (): Promise<JavaInfo> => {
+    return ipcRenderer.invoke('java:get-info') as Promise<JavaInfo>
+  },
+
+  checkMinecraftVersion: async (
+    versionId: string,
+    forceRefresh = false
+  ): Promise<MinecraftVersionInfo> => {
+    return ipcRenderer.invoke(
+      'minecraft:check-version',
+      versionId,
+      forceRefresh
+    ) as Promise<MinecraftVersionInfo>
+  },
+
+  getMinecraftVersionDetails: async (
+    versionId: string,
+    forceRefresh = false
+  ): Promise<MinecraftVersionDetails> => {
+    return ipcRenderer.invoke(
+      'minecraft:get-version-details',
+      versionId,
+      forceRefresh
+    ) as Promise<MinecraftVersionDetails>
+  },
+
+  getMinecraftInstallStatus: async (
+    versionId: string,
+    gameDirectory: string
+  ): Promise<MinecraftInstallStatus> => {
+    return ipcRenderer.invoke(
+      'minecraft:get-install-status',
+      versionId,
+      gameDirectory
+    ) as Promise<MinecraftInstallStatus>
+  },
+
+  installMinecraftVersion: async (
+    versionId: string,
+    gameDirectory: string
+  ): Promise<MinecraftInstallResult> => {
+    return ipcRenderer.invoke(
+      'minecraft:install-version',
+      versionId,
+      gameDirectory
+    ) as Promise<MinecraftInstallResult>
+  },
+
+  onInstallProgress: (
+    callback: (progress: MinecraftInstallProgress) => void
+  ): void => {
+    ipcRenderer.removeAllListeners('minecraft:install-progress')
+
+    ipcRenderer.on(
+      'minecraft:install-progress',
+      (_event, progress: MinecraftInstallProgress) => {
+        callback(progress)
+      }
+    )
+  },
+
+  removeInstallProgressListener: (): void => {
+    ipcRenderer.removeAllListeners('minecraft:install-progress')
+  },
+
+  getMicrosoftAccount: async (): Promise<MicrosoftAccountState> => {
+    return ipcRenderer.invoke(
+      'auth:get-microsoft-account'
+    ) as Promise<MicrosoftAccountState>
+  },
+
+  loginMicrosoft: async (): Promise<MicrosoftLoginResult> => {
+    return ipcRenderer.invoke(
+      'auth:login-microsoft'
+    ) as Promise<MicrosoftLoginResult>
+  },
+
+  logoutMicrosoft: async (): Promise<boolean> => {
+    return ipcRenderer.invoke('auth:logout-microsoft') as Promise<boolean>
+  },
+
+  launchMinecraftGame: async (
+    request: MinecraftLaunchRequest
+  ): Promise<MinecraftLaunchResult> => {
+    return ipcRenderer.invoke(
+      'minecraft:launch-game',
+      request
+    ) as Promise<MinecraftLaunchResult>
+  },
+
+  getMinecraftGameState: async (): Promise<MinecraftGameState> => {
+    return ipcRenderer.invoke(
+      'minecraft:get-game-state'
+    ) as Promise<MinecraftGameState>
+  },
+
+  stopMinecraftGame: async (): Promise<boolean> => {
+    return ipcRenderer.invoke('minecraft:stop-game') as Promise<boolean>
+  },
+
+  onGameLog: (callback: (log: MinecraftGameLog) => void): void => {
+    ipcRenderer.removeAllListeners('minecraft:game-log')
+    ipcRenderer.on('minecraft:game-log', (_event, log: MinecraftGameLog) => {
+      callback(log)
+    })
+  },
+
+  onGameState: (callback: (state: MinecraftGameState) => void): void => {
+    ipcRenderer.removeAllListeners('minecraft:game-state')
+    ipcRenderer.on(
+      'minecraft:game-state',
+      (_event, state: MinecraftGameState) => {
+        callback(state)
+      }
+    )
+  },
+
+  removeGameListeners: (): void => {
+    ipcRenderer.removeAllListeners('minecraft:game-log')
+    ipcRenderer.removeAllListeners('minecraft:game-state')
+  },
+
+  getDefaultGameDirectory: async (): Promise<string> => {
+    return ipcRenderer.invoke(
+      'folder:get-default-game-directory'
+    ) as Promise<string>
+  },
+
+  chooseGameDirectory: async (
+    currentPath: string | null
+  ): Promise<string | null> => {
+    return ipcRenderer.invoke(
+      'folder:choose-game-directory',
+      currentPath
+    ) as Promise<string | null>
   }
 }
 
-export {}
+contextBridge.exposeInMainWorld('electron', electronAPI)
+contextBridge.exposeInMainWorld('api', api)
